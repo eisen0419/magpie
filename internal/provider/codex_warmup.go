@@ -191,9 +191,12 @@ func (c codexWarmer) warmNow(ctx context.Context, which string, dayAts []string)
 			}
 			p, seen := prev[w.Name]
 			if windowAbsent(q, w, p, now) {
-				// an account without it (a Claude Enterprise plan with five
-				// hours only): warmed, it stayed not started, sent again
-				// every few hours for good (koohoko5924, Idle 189)
+				// an account without it: a week a shorter window running
+				// leaves out (a Claude Enterprise plan with five hours
+				// only, koohoko5924, Idle 189), or a 5-hour window the
+				// card learned the vendor sends none for
+				// (claudeFiveHourNone). Warmed, it stayed not started and
+				// was sent again on its backoff.
 				next[w.Name] = warmWindow{Absent: true}
 				continue
 			}
@@ -313,13 +316,33 @@ func withExpected(ws, expect []QuotaWindow) []QuotaWindow {
 // hours idle too; a reading that has it, the account used since, ends it.
 // A week seen running and left out now, reset while the five hours run,
 // is not started, as is any window a reading only partly told
-// (claudeUsageEntry.whole) leaves out.
+// (claudeUsageEntry.whole) leaves out. A 5-hour window the card learned
+// the vendor sends none for (claudeFiveHourNone) is absent too, even
+// once seen: the card leaves it out of a whole reading on purpose, and a
+// later reading that has it ends that.
 func windowAbsent(q SubscriptionQuota, w QuotaWindow, p warmWindow, now time.Time) bool {
 	if slices.ContainsFunc(q.Windows, func(x QuotaWindow) bool { return x.Name == w.Name }) {
 		return false
 	}
-	return p.Absent || p.ResetsAt.IsZero() && p.Used == 0 && !slices.ContainsFunc(q.Windows, func(x QuotaWindow) bool { return x.partial }) &&
+	if p.Absent || claudeFiveHourNone(q, w) {
+		return true
+	}
+	return p.ResetsAt.IsZero() && p.Used == 0 && !slices.ContainsFunc(q.Windows, func(x QuotaWindow) bool { return x.partial }) &&
 		shorterRunning(q.Windows, w.Span, now)
+}
+
+// claudeFiveHourNone says w is the 5-hour window of an account the card
+// learned has none (claudeNoFiveHour). A whole reading that has windows
+// and no 5-hour one is that account: an idle account not yet seen used
+// still carries the window, unstarted, and a reading that may leave
+// windows out (partial) doesn't say the account hasn't it. A reading
+// with no windows at all is an account never read, not one learned to
+// have none.
+func claudeFiveHourNone(q SubscriptionQuota, w QuotaWindow) bool {
+	if w.Name != "5 hours" || len(q.Windows) == 0 {
+		return false
+	}
+	return !slices.ContainsFunc(q.Windows, func(x QuotaWindow) bool { return x.partial || x.Name == "5 hours" })
 }
 
 // shorterRunning says whether one of ws, the account's own and shorter
@@ -716,8 +739,9 @@ func onNotStarted(agent string, expect []QuotaWindow, f func(user string)) func(
 
 // usageRead tells onNotStarted's f of each account in usage, read for
 // agent, with a window not started: nothing used and no reset known, or
-// left out of the read, but for one left out while a shorter window runs,
-// which the account hasn't (windowAbsent).
+// left out of the read, but for one the account hasn't — left out while
+// a shorter window runs, or a 5-hour window the card learned it hasn't
+// (windowAbsent, claudeFiveHourNone).
 func usageRead(agent string, usage map[string]SubscriptionQuota) {
 	h := &notStartedHooks
 	h.Lock()
@@ -733,9 +757,10 @@ func usageRead(agent string, usage map[string]SubscriptionQuota) {
 		}
 		ws := q.Windows
 		for _, e := range hook.expect {
-			if !slices.ContainsFunc(q.Windows, func(w QuotaWindow) bool { return w.Name == e.Name }) && !shorterRunning(q.Windows, e.Span, now) {
-				ws = append(slices.Clip(ws), QuotaWindow{Name: e.Name, Span: e.Span})
+			if slices.ContainsFunc(q.Windows, func(w QuotaWindow) bool { return w.Name == e.Name }) || shorterRunning(q.Windows, e.Span, now) || claudeFiveHourNone(q, e) {
+				continue
 			}
+			ws = append(slices.Clip(ws), QuotaWindow{Name: e.Name, Span: e.Span})
 		}
 		if slices.ContainsFunc(ws, notStarted) {
 			hook.f(user)

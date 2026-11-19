@@ -51,8 +51,10 @@ func warmClaudeLogin(send func(ctx context.Context, configDir string) error) fun
 	}
 }
 
-// claudeWindowsExpected is the windows every Claude account has: Anthropic
-// leaves them out (null) for an account never used.
+// claudeWindowsExpected is the windows a Claude account is taken to have.
+// Anthropic leaves one out (null) until a request starts it. A 5-hour
+// window the card learned the account hasn't (claudeNoFiveHour) is marked
+// absent instead (windowAbsent) and sent nothing.
 var claudeWindowsExpected = []QuotaWindow{{Name: "5 hours", Span: 5 * time.Hour}, {Name: "7 days", Span: 7 * 24 * time.Hour}}
 
 // claudeWarmedNow has what the Claude account user has left read again,
