@@ -194,3 +194,232 @@ func TestBareIDsListGroupNamedForAModel(t *testing.T) {
 		}
 	}
 }
+
+// #7380 (Sakugar): with Model ids without the provider set to Only, a
+// customized auto-discovered group that lists its members alone
+// (Group.Unlists) stayed auto/gpt-6.2-astra. The members are hidden, so
+// no provider row carries the bare id, and the group's own id is
+// auto-<slug>, not the model. A request for gpt-6.2-astra already reaches
+// the group (GroupFor before Resolve), so the list offers that id: beside
+// auto/<model> when bare ids are on, and in auto/<model>'s place under
+// Only. Off, the list is as it was. With the members listed, the bare id
+// is still that one row.
+func TestBareIDsListUnlistedAutoGroup(t *testing.T) {
+	fresh(t)
+	for _, p := range []provider.Provider{
+		{ID: "a", Name: "A", Key: "k", Models: []string{"gpt-6.2-astra", "only-a"}},
+		{ID: "b", Name: "B", Key: "k", Models: []string{"gpt-6.2-astra", "only-b"}},
+	} {
+		f := &fake{t: t, ctype: "application/json", reply: `{"id":"from-` + p.ID + `","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`}
+		up := httptest.NewServer(f)
+		t.Cleanup(up.Close)
+		p.Chat = up.URL + "/v1"
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// b first: a request that went by Resolve instead would reach a
+	g, _, ok := provider.FindGroup("group/auto-gpt-6-2-astra")
+	if !ok || !g.Auto {
+		t.Fatalf("found group: %+v %v", g, ok)
+	}
+	g.Members = []string{"b/gpt-6.2-astra", "a/gpt-6.2-astra"}
+	g.Routing = provider.Ordered
+	g.Unlists = true
+	if err := provider.SaveGroup(g); err != nil {
+		t.Fatal(err)
+	}
+	g, _, ok = provider.FindGroup("group/auto-gpt-6-2-astra")
+	if !ok || g.Auto || g.Ref() == "" || !strings.HasPrefix(g.Ref(), "auto/") {
+		t.Fatalf("customized group: %+v ref %q %v", g, g.Ref(), ok)
+	}
+	public, bare := g.Ref(), strings.TrimPrefix(g.Ref(), "auto/")
+	if gid, ok := provider.GroupFor(bare); !ok || gid != "group/auto-gpt-6-2-astra" {
+		t.Fatalf("GroupFor(%q) = %q %v, want the auto group", bare, gid, ok)
+	}
+
+	get := func() []string { return listedIDs(t, httptest.NewRequest("GET", "/v1/models", nil)) }
+	count := func(ids []string, id string) int {
+		n := 0
+		for _, x := range ids {
+			if x == id {
+				n++
+			}
+		}
+		return n
+	}
+	chat := func(model string) string {
+		rec := httptest.NewRecorder()
+		New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}]}`)))
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d %s", model, rec.Code, rec.Body.String())
+		}
+		return rec.Header().Get("X-Magpie-Provider")
+	}
+
+	off := get()
+	if !slices.Contains(off, public) || slices.Contains(off, bare) || slices.Contains(off, "a/gpt-6.2-astra") || slices.Contains(off, "b/gpt-6.2-astra") {
+		t.Fatalf("off: %v, want %s and no bare id or member", off, public)
+	}
+
+	if err := provider.SetBareIDs(true, false); err != nil {
+		t.Fatal(err)
+	}
+	on := get()
+	if !slices.Equal(on[:len(off)], off) || count(on, bare) != 1 || count(on, public) != 1 {
+		t.Fatalf("on: %v, want %v and then %s once", on, off, bare)
+	}
+
+	if err := provider.SetBareIDs(true, true); err != nil {
+		t.Fatal(err)
+	}
+	only := get()
+	if slices.Contains(only, public) || slices.Contains(only, "a/only-a") || slices.Contains(only, "b/only-b") {
+		t.Fatalf("Only: %v still lists a prefixed id", only)
+	}
+	if i, j := slices.Index(off, public), slices.Index(only, bare); i != j || count(only, bare) != 1 {
+		t.Fatalf("Only: %s at %d of %v, want once where %s was, %d of %v", bare, j, only, public, i, off)
+	}
+	rec := httptest.NewRecorder()
+	New().Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models/"+bare, nil))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"id":"`+bare+`"`) {
+		t.Fatalf("GET /v1/models/%s: %d %s", bare, rec.Code, rec.Body.String())
+	}
+	for _, m := range []string{bare, public, "group/auto-gpt-6-2-astra"} {
+		if by := chat(m); by != "b" {
+			t.Fatalf("%s answered by %q, want the group's first member, b", m, by)
+		}
+	}
+
+	// members listed again: the bare id is still one row, the group's
+	g.Unlists = false
+	if err := provider.SaveGroup(g); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SetBareIDs(true, false); err != nil {
+		t.Fatal(err)
+	}
+	if listed := get(); count(listed, bare) != 1 || count(listed, public) != 1 || !slices.Contains(listed, "a/gpt-6.2-astra") {
+		t.Fatalf("members listed, on: %v, want %s and %s once and the members", listed, public, bare)
+	}
+	if err := provider.SetBareIDs(true, true); err != nil {
+		t.Fatal(err)
+	}
+	if listed := get(); count(listed, bare) != 1 || slices.Contains(listed, public) || slices.Contains(listed, "a/gpt-6.2-astra") || slices.Contains(listed, "b/gpt-6.2-astra") {
+		t.Fatalf("members listed, Only: %v, want %s once and no prefixed row of it", listed, bare)
+	}
+}
+
+// A bare id is listed for an auto group only when a request for it reaches
+// that group. A group the user made with the model's id wins GroupFor, so
+// the auto group stays auto/<model> under Only and the bare id is the
+// user's group, once.
+func TestBareIDsSkipAutoGroupWhoseModelAnotherGroupTakes(t *testing.T) {
+	fresh(t)
+	for _, p := range []provider.Provider{
+		{ID: "a", Name: "A", Key: "k", Models: []string{"route-keep", "side"}},
+		{ID: "b", Name: "B", Key: "k", Models: []string{"route-keep"}},
+	} {
+		f := &fake{t: t, ctype: "application/json", reply: `{"id":"from-` + p.ID + `","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`}
+		up := httptest.NewServer(f)
+		t.Cleanup(up.Close)
+		p.Chat = up.URL + "/v1"
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// the auto group is saved first, so the list considers it before the
+	// user's group: a bare id taken without asking GroupFor would be the
+	// auto group's, and the user's group would keep group/route-keep
+	g, _, ok := provider.FindGroup("group/auto-route-keep")
+	if !ok {
+		t.Fatal("no auto group for route-keep")
+	}
+	g.Members = []string{"b/route-keep", "a/route-keep"}
+	g.Routing = provider.Ordered
+	g.Unlists = true
+	if err := provider.SaveGroup(g); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SaveGroup(provider.Group{ID: "route-keep", Name: "Route keep", Members: []string{"a/side"}, Routing: provider.Ordered}); err != nil {
+		t.Fatal(err)
+	}
+	if gid, ok := provider.GroupFor("route-keep"); !ok || gid != "group/route-keep" {
+		t.Fatalf("GroupFor(route-keep) = %q %v, want the user's group", gid, ok)
+	}
+	if err := provider.SetBareIDs(true, true); err != nil {
+		t.Fatal(err)
+	}
+	got := listedIDs(t, httptest.NewRequest("GET", "/v1/models", nil))
+	n := 0
+	for _, id := range got {
+		if id == "route-keep" {
+			n++
+		}
+	}
+	if n != 1 || !slices.Contains(got, "auto/route-keep") {
+		t.Fatalf("Only: %v, want route-keep once and auto/route-keep kept", got)
+	}
+	chat := func(model string) string {
+		rec := httptest.NewRecorder()
+		New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}]}`)))
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d %s", model, rec.Code, rec.Body.String())
+		}
+		return rec.Header().Get("X-Magpie-Provider")
+	}
+	if by := chat("route-keep"); by != "a" {
+		t.Fatalf("route-keep answered by %q, want the user's group, a", by)
+	}
+	if by := chat("auto/route-keep"); by != "b" {
+		t.Fatalf("auto/route-keep answered by %q, want the auto group's first member, b", by)
+	}
+}
+
+// A found group whose providers are kept for routing groups
+// (Provider.Unlisted) has no member row to carry the bare id either. Only
+// lists it by the model, which is where a request for that id goes.
+func TestBareIDsListAutoGroupOfUnlistedProviders(t *testing.T) {
+	fresh(t)
+	for _, p := range []provider.Provider{
+		{ID: "a", Name: "A", Key: "k", Models: []string{"solo-model"}, Unlisted: true},
+		{ID: "b", Name: "B", Key: "k", Models: []string{"solo-model"}, Unlisted: true},
+	} {
+		f := &fake{t: t, ctype: "application/json", reply: `{"id":"from-` + p.ID + `","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`}
+		up := httptest.NewServer(f)
+		t.Cleanup(up.Close)
+		p.Chat = up.URL + "/v1"
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g, _, ok := provider.FindGroup("group/auto-solo-model")
+	if !ok || !g.Auto || g.Ref() != "auto/solo-model" {
+		t.Fatalf("found group: %+v ref %q %v", g, g.Ref(), ok)
+	}
+	get := func() []string { return listedIDs(t, httptest.NewRequest("GET", "/v1/models", nil)) }
+	off := get()
+	if !slices.Equal(off, []string{"auto/solo-model"}) {
+		t.Fatalf("off: %v", off)
+	}
+	if err := provider.SetBareIDs(true, false); err != nil {
+		t.Fatal(err)
+	}
+	if on := get(); !slices.Equal(on, []string{"auto/solo-model", "solo-model"}) {
+		t.Fatalf("on: %v", on)
+	}
+	if err := provider.SetBareIDs(true, true); err != nil {
+		t.Fatal(err)
+	}
+	if only := get(); !slices.Equal(only, []string{"solo-model"}) {
+		t.Fatalf("Only: %v", only)
+	}
+	rec := httptest.NewRecorder()
+	New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"solo-model","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 || rec.Header().Get("X-Magpie-Provider") != "a" {
+		t.Fatalf("solo-model: %d by %q %s", rec.Code, rec.Header().Get("X-Magpie-Provider"), rec.Body.String())
+	}
+}

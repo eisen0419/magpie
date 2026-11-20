@@ -23,7 +23,10 @@ import (
 // id like anthropic/claude-x that names a provider of the user's), isn't
 // listed by it. A routing group the user made is listed by its own id as
 // well (fast for group/fast, glm-5.2 for group/glm-5.2), where a
-// request for that id reaches the group.
+// request for that id reaches the group. A group magpie found is listed
+// by the model (gpt-6.2-astra for auto/gpt-6.2-astra) the same way, which
+// is the id a request for it reaches the group by, including when the
+// group lists its members alone so no provider row carries that id.
 
 // BareModelIDs says whether /v1/models lists models by their bare ids too.
 func BareModelIDs() bool { return settings.Shared().BareModelIDs }
@@ -63,7 +66,8 @@ type Bare struct {
 
 // BareEntries are the rows a list of shown adds for the bare ids, in the
 // order the models first appear in shown, each once, then the routing
-// groups the user made, by their own ids (groupBare).
+// groups no model's bare id reaches, by the id a request for them uses
+// (groupBare).
 func BareEntries(shown []Entry) []Bare {
 	defer Hold()()
 	ids := make(map[string]bool, len(shown))
@@ -86,8 +90,8 @@ func BareEntries(shown []Entry) []Bare {
 			reached[i] = true
 		}
 	}
-	// then each routing group the user made that no model's bare id
-	// reaches, by its own id
+	// then each routing group that no model's bare id reaches: one the
+	// user made, by its own id, and one magpie found, by its model
 	for j, e := range shown {
 		if e.Group == "" || reached[j] {
 			continue
@@ -100,12 +104,16 @@ func BareEntries(shown []Entry) []Bare {
 	return out
 }
 
-// groupBare is the Bare for the routing group the user made at shown[j]
-// (小八 on Discord: group/fast is long to type into a client), by the id
-// a request for it reaches it by: its own id, fast. Only where that is
-// unambiguous: not for a group magpie found (listed under its model's
-// bare id already, or by its auto/<model>), nor by an id listed already
-// or given to another row, or one GroupFor takes elsewhere.
+// groupBare is the Bare for the routing group at shown[j] (小八 on Discord:
+// group/fast is long to type into a client), by the id a request for it
+// reaches it by. A group the user made, listed as group/<id>, by its own
+// id, fast. A group magpie found, listed as auto/<model>, by that model
+// (gpt-6.2-astra for auto/gpt-6.2-astra; #7380, Sakugar): the id GroupFor
+// takes to the group, which a provider's row of the model would have
+// carried. Only where that is unambiguous: not by an id listed already or
+// given to another row, and not when a request for it reaches some other
+// row (a group the user made with the model's id wins GroupFor, so the
+// auto group stays auto/<model>).
 //
 // A group named for a model a provider serves (glm-5.2) is listed so
 // too: a request for glm-5.2 reaches the group, GroupFor before Resolve,
@@ -113,17 +121,36 @@ func BareEntries(shown []Entry) []Bare {
 // row's bare id reaches the group first (BareEntries' reached); when it
 // isn't (the group lists its members alone, Group.Unlists; a provider
 // kept for routing groups; the agent's hidden models), the group's own
-// row carries the id, or Only left group/glm-5.2 (小八 on Discord).
+// row carries the id, or Only left group/glm-5.2 (小八 on Discord). The
+// same holds for a found group: while a member's row is shown it carries
+// the model's bare id, and when none is, the auto/<model> row does.
 func groupBare(shown []Entry, all []Group, entries []Entry, ids, seen map[string]bool, j int) (Bare, bool) {
-	e := shown[j]
-	id := e.Group
-	if !e.Named || id == "" || e.ID != GroupPrefix+id || strings.Contains(id, "/") || ids[id] || seen[id] {
+	id := groupBareID(shown[j])
+	if id == "" || strings.Contains(id, "/") || ids[id] || seen[id] {
 		return Bare{}, false
 	}
-	if i := bareTarget(shown, all, entries, id); i < 0 || shown[i].Group != id {
+	// a request for id has to reach this row, not another group that
+	// goes by the same model, and not a provider's model
+	if bareTarget(shown, all, entries, id) != j {
 		return Bare{}, false
 	}
 	return Bare{ID: id, Of: j}, true
+}
+
+// groupBareID is the id groupBare lists the group by: its own id for a
+// group listed as group/<id>, the model for one listed as auto/<model>.
+// "" when the row is not a group's to list that way.
+func groupBareID(e Entry) string {
+	if e.Group == "" {
+		return ""
+	}
+	if model, ok := strings.CutPrefix(e.ID, AutoPrefix); ok && model != "" {
+		return model
+	}
+	if !e.Named || e.ID != GroupPrefix+e.Group {
+		return ""
+	}
+	return e.Group
 }
 
 // bareTarget is the index in shown of the entry a request for the bare id

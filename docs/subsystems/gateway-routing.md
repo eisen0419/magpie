@@ -3162,17 +3162,25 @@ the row of the entry that id reaches, with its label, under the bare id.
   not listed twice.
 - A routing group the user made is listed by its own id too, `fast` beside
   `group/fast` (`groupBare`; 小八 on Discord), after the models' bare ids,
-  and under Only in `group/fast`'s place. Only where a request for that
-  id reaches the group: not when it is listed already, when `GroupFor` of
-  it reaches another group, or for a group magpie found (its
-  `auto/<model>` row is listed under the model's bare id already). A
-  group a model's bare id already reaches adds nothing: a group named for
-  a model a provider serves, `glm-5.2`, is listed through that model's
-  row while the row is shown, and by its own row when it isn't (the
-  group lists its members alone, a provider kept for routing groups, the
-  agent's hidden models), since `GroupFor` takes `glm-5.2` to the group
-  before `Resolve` either way. Before, such a group stayed `group/glm-5.2`
-  under Only (小八 on Discord, v0.1.4377).
+  and under Only in `group/fast`'s place. A group magpie found is listed
+  by its model the same way, `gpt-6.2-astra` for `auto/gpt-6.2-astra`
+  (`groupBareID`; #7380, Sakugar): that is the id `GroupFor` takes to the
+  group. While a member's row is shown, that row carries the bare id and
+  the group's row adds nothing. When no member's row is shown — the group
+  lists its members alone (`Group.Unlists`), or its providers are kept
+  for routing groups — the `auto/<model>` row carries it, beside
+  `auto/<model>` when bare ids are on, and in its place under Only.
+  Only where a request for that id reaches this row: not when it is
+  listed already, and not when `GroupFor` of it reaches another group
+  (a group the user made with the model's id wins, and the auto group
+  stays `auto/<model>`). A group a model's bare id already reaches adds
+  nothing: a group named for a model a provider serves, `glm-5.2`, is
+  listed through that model's row while the row is shown, and by its own
+  row when it isn't (the group lists its members alone, a provider kept
+  for routing groups, the agent's hidden models), since `GroupFor` takes
+  `glm-5.2` to the group before `Resolve` either way. Before, such a
+  group stayed `group/glm-5.2` under Only (小八 on Discord, v0.1.4377),
+  and a found group listing alone stayed `auto/<model>` (#7380).
 - The target must be in the list shown: a gateway key held to some models
   sees only the bare ids that reach one of its models, so a key held to
   `b/*` doesn't see `glm-5.3` that would go to `a`.
@@ -3205,7 +3213,12 @@ the row of the entry that id reaches, with its label, under the bare id.
   Code's discovery, a held key, another magpie) in
   [`bare_ids_test.go`](../../internal/gateway/bare_ids_test.go),
   `TestBareIDsListUserGroups` (a user's group by its own id, on and Only,
-  a group named like a model, a found group, a held key) in
+  a group named like a model, a found group, a held key),
+  `TestBareIDsListUnlistedAutoGroup` (a customized found group listing
+  alone, on and Only, and with its members listed),
+  `TestBareIDsSkipAutoGroupWhoseModelAnotherGroupTakes` (a user's group
+  with the model's id keeps the bare id; the found group stays
+  `auto/<model>`) and `TestBareIDsListAutoGroupOfUnlistedProviders` in
   [`bare_group_ids_test.go`](../../internal/gateway/bare_group_ids_test.go),
   `TestBareModelIDsSetting` and `TestBareModelIDsOnlySetting` in
   `internal/gui`, and `internal/gui/tests/bare-ids.test.cjs`.
