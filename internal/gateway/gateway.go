@@ -1970,6 +1970,10 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 			// when the user asked for it (settings.BareModelIDs): a client
 			// moved from another proxy asks for gpt-5.6-sol (love1sbug on X).
 			// Never for another magpie, whose provider would list each twice.
+			// Never for omp either: magpie writes its models.yml with
+			// provider/model ids, so bare ids on /v1/models would either append
+			// duplicate bare entries into omp's picker or (under BareOnly) drop
+			// the provider/model ids discovery matches service_tiers against (#7374).
 			// Each row is the entry the bare id reaches, its label that one's.
 			//
 			// Or by its bare id alone, in place of the provider/model ids
@@ -1978,7 +1982,7 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 			// listed every model twice, and a gateway has no Agents page
 			// to pick its models on (qQianye on X)
 			rows, ids, only := slices.Clip(shown), map[int]string{}, false
-			if !magpie && provider.BareModelIDs() {
+			if !magpie && agent != "omp" && provider.BareModelIDs() {
 				bares := provider.BareEntries(shown)
 				if only = provider.BareOnly(); only {
 					at, bare := provider.OnlyBare(shown, bares)

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/gateway"
 	"gopkg.in/yaml.v3"
 )
 
@@ -39,8 +40,9 @@ func TestOmpListsImageModelsForItsImageRole(t *testing.T) {
 	if e.Auth != "" || e.APIKey != "magpie" {
 		t.Errorf("auth %q, apiKey %q: want the gateway's key, not auth: none", e.Auth, e.APIKey)
 	}
-	if e.BaseURL != here(home).v1() {
-		t.Errorf("baseUrl = %q, want %q: omp posts to it + /images/generations", e.BaseURL, here(home).v1())
+	wantBase := gateway.AgentURL(here(home).gw(), "omp") + "/v1"
+	if e.BaseURL != wantBase {
+		t.Errorf("baseUrl = %q, want %q: omp posts to it + /images/generations", e.BaseURL, wantBase)
 	}
 	var img *ompModel
 	for i, m := range e.Models {

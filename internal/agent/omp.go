@@ -142,7 +142,7 @@ func ompDir(home string) (dir string, shared bool) {
 
 func omp(home string) *Agent {
 	dir, shared := ompDir(home)
-	a := ompAt(here(home), dir, func() ompProviderEntry { return ompProvider() })
+	a := ompAt(here(home), dir, func() string { return ompVersion() })
 	// Pi's folder is no sign of omp: its config.yml or its command is
 	a.dirShared = shared
 	return a
@@ -176,7 +176,7 @@ func ompProfiles(home string) []*Agent {
 	sort.Strings(names)
 	var out []*Agent
 	for _, name := range names {
-		a := ompAt(here(home), filepath.Join(root, "profiles", name, "agent"), func() ompProviderEntry { return ompProvider() })
+		a := ompAt(here(home), filepath.Join(root, "profiles", name, "agent"), func() string { return ompVersion() })
 		a.ID, a.Name = "omp#"+name, "omp · "+name
 		// the default row keeps omp's name, its command and its own lists
 		a.Aliases, a.UA, a.Bin = nil, nil, ""
@@ -194,12 +194,12 @@ func ompProfiles(home string) []*Agent {
 // known), and without one its models offer xhigh rather than a max an older
 // omp would refuse.
 func ompIn(at place) *Agent {
-	return ompAt(at, at.join(".omp", "agent"), func() ompProviderEntry { return ompProviderAt(at.gw(), at.version) })
+	return ompAt(at, at.join(".omp", "agent"), func() string { return at.version })
 }
 
-// ompAt is omp with its agent folder at dir, magpie's entry in its
-// models.yml being entry's.
-func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
+// ompAt is omp with its agent folder at dir, whose installed version is
+// version().
+func ompAt(at place, dir string, version func() string) *Agent {
 	// omp reads the .yml and falls back to the .yaml
 	pick := func(name string) string {
 		yml := filepath.Join(dir, name+".yml")
@@ -213,7 +213,7 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 	// magpie's entry, on the protocol picked, laid over the one in the
 	// models file at path (ompKept), an api the user typed there kept
 	ompProvider := func(path string) any {
-		return ompKept(path, ompAPIKept(path, ompOn(entry(), ompProtocol(protocol))))
+		return ompKept(path, ompAPIKept(path, ompOn(ompProviderAt(at.gw(), version()), ompProtocol(protocol))))
 	}
 	path := pick("config")
 	// the entries of enabledModels a sync took out (scope_gone.go)
@@ -552,9 +552,14 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 				return ""
 			}
 			models := pick("models")
-			if d := wiringOff("omp", models, func(k string) (string, bool) { return edit.GetYAML(models, "providers."+magpieID+"."+k) },
-				"baseUrl", at.v1()); d != "" {
-				return d
+			want := ompBaseURL(at.gw(), version())
+			get := func(k string) (string, bool) { return edit.GetYAML(models, "providers."+magpieID+"."+k) }
+			if d := wiringOff("omp", models, get, "baseUrl", want); d != "" {
+				if v, _ := get("baseUrl"); want == at.v1() || v == "" ||
+					strings.HasSuffix(strings.TrimSuffix(strings.TrimSpace(v), "/"), gateway.AgentPath+"omp/v1") ||
+					!reachesMagpie(v, at.v1()) {
+					return d
+				}
 			}
 			// a default role on magpie that enabledModels leaves out never
 			// starts; setting it again adds it there (#1769)
@@ -644,6 +649,21 @@ type ompProviderEntry struct {
 	// Discord). promptCacheSessionHeader has omp send its session id in it.
 	Compat map[string]string `yaml:"compat,omitempty"`
 	Models []ompModel        `yaml:"models"`
+	// Discovery, when set, has omp ask the gateway's /v1/models for each
+	// row's service_tiers (ompServiceTierSince). A static model entry
+	// cannot say them: omp's schema has no such field.
+	Discovery *ompDiscovery `yaml:"discovery,omitempty"`
+}
+
+// ompDiscovery is the bit of omp's provider discovery magpie writes
+// (ProviderDiscoverySchema): openai-models-list, which copies service_tiers
+// onto the runtime model, and advertisedReasoning off, so the thinking
+// magpie wrote on each model stays the one omp uses. The list also
+// advertises supported_reasoning_levels; left on, discovery would take
+// those over a model magpie gave no ladder.
+type ompDiscovery struct {
+	Type                string `yaml:"type"`
+	AdvertisedReasoning bool   `yaml:"advertisedReasoning"`
 }
 
 // ompSessionSince is the first omp whose compat takes
@@ -786,7 +806,7 @@ func ompProviderAt(gw, version string) ompProviderEntry {
 	}
 	images := ompImageModels(version, ms)
 	ms = append(ms, images...)
-	e := ompProviderEntry{BaseURL: gw + "/v1", API: "openai-completions", Auth: "none", Models: ms}
+	e := ompProviderEntry{BaseURL: ompBaseURL(gw, version), API: "openai-completions", Auth: "none", Models: ms}
 	if ua := ompUserAgent(version); ua != "" {
 		e.Headers = map[string]string{"User-Agent": ua}
 	}
@@ -802,7 +822,38 @@ func ompProviderAt(gw, version string) ompProviderEntry {
 	if key := keyAt(gw); key != gateway.Token || len(images) > 0 {
 		e.Auth, e.APIKey = "", key
 	}
+	// /fast ultra reads serviceTiers on the model omp loaded. The gateway's
+	// /v1/models already lists them; a static entry cannot (ompDiscovery).
+	if ompReadsServiceTiers(version) {
+		e.Discovery = &ompDiscovery{Type: "openai-models-list", AdvertisedReasoning: false}
+	}
 	return e
+}
+
+// ompServiceTierSince is the first omp whose openai-models-list discovery
+// copies a /v1/models row's service_tiers onto the model it runs
+// (oh-my-pi#17577, shipped in 18.15.0). Before that the copy isn't there,
+// and discovery would only replace the static models omp already has.
+const ompServiceTierSince = "18.15.0"
+
+// ompReadsServiceTiers says whether omp at version v takes service tiers
+// from a provider's openai-models-list discovery. One whose version isn't
+// known is taken for an older one: discovery is a schema field, and writing
+// it for an omp that refuses the shape turns the whole models.yml away.
+func ompReadsServiceTiers(v string) bool {
+	return v != "" && !Newer(ompServiceTierSince, v)
+}
+
+// ompBaseURL is the provider baseUrl magpie writes for omp: when discovery
+// is written (ompReadsServiceTiers), /agent/omp/v1 names omp in the path so
+// omp's keyless /models discovery — which goes through bare fetch with Bun's
+// User-Agent — is still recognized as omp and receives omp's filtered
+// catalog (#7374). Older omp versions keep gw + "/v1".
+func ompBaseURL(gw, version string) string {
+	if ompReadsServiceTiers(version) {
+		return gateway.AgentURL(gw, "omp") + "/v1"
+	}
+	return gw + "/v1"
 }
 
 // ompKindSince is the first omp whose models.yml takes a model's kind and
@@ -859,32 +910,46 @@ func ompGeminiMode(id string) string {
 // ompKept is magpie's entry e laid over the one in the models.yml at path.
 // omp keeps keys its schema doesn't name and never writes the file itself,
 // so what is there beside magpie's is the user's: modelOverrides (a model's
-// context or cost), discovery, disableStrictTools, remoteCompaction, a
-// header or compat flag of their own (models-config-schema-bundle.ts
-// ProviderConfigSchema). Each stays; the address, API, auth, key and model
-// list are magpie's, an auth or key it no longer writes gone with it, so a
-// loopback's auth: none never sits beside the key a WSL omp needs (#2030).
+// context or cost), a discovery the user wrote, disableStrictTools,
+// remoteCompaction, a header or compat flag of their own
+// (models-config-schema-bundle.ts ProviderConfigSchema). Each stays; the
+// address, API, auth, key and model list are magpie's, an auth or key it no
+// longer writes gone with it, so a loopback's auth: none never sits beside
+// the key a WSL omp needs (#2030).
 //
 // A User-Agent header is magpie's while it is one magpie writes
 // (ompOwnUserAgent): the one it writes now takes its place, or none, so an
 // omp that names itself is no longer named plain omp by an older magpie's
 // header. Any other is the user's and stays, in place of magpie's.
+//
+// Discovery is magpie's while it is the openai-models-list it writes so
+// /fast ultra can see service_tiers (ompOwnDiscovery). The user's own,
+// whatever its type, stays, and magpie's is taken out again for an omp that
+// doesn't read the tiers.
 func ompKept(path string, e ompProviderEntry) any {
-	kept := yamlKept(path, "providers."+magpieID, e, "baseUrl", "api", "auth", "apiKey", "models")
-	out, ok := kept.(map[string]any)
-	if !ok {
-		return kept
-	}
 	var have map[string]any
+	var hadDiscovery map[string]any
 	if raw, err := edit.Read(path); err == nil {
 		var doc struct {
 			Providers map[string]struct {
-				Headers map[string]any `yaml:"headers"`
+				Headers   map[string]any `yaml:"headers"`
+				Discovery map[string]any `yaml:"discovery"`
 			} `yaml:"providers"`
 		}
 		if yaml.Unmarshal(raw, &doc) == nil {
 			have = doc.Providers[magpieID].Headers
+			hadDiscovery = doc.Providers[magpieID].Discovery
 		}
+	}
+	// a discovery the user wrote is not replaced by the one magpie would
+	// write, and isn't taken out when this omp doesn't read tiers
+	if len(hadDiscovery) > 0 && !ompOwnDiscovery(hadDiscovery) {
+		e.Discovery = nil
+	}
+	kept := yamlKept(path, "providers."+magpieID, e, "baseUrl", "api", "auth", "apiKey", "models")
+	out, ok := kept.(map[string]any)
+	if !ok {
+		return kept
 	}
 	theirs := map[string]any{}
 	for k, v := range have {
@@ -914,7 +979,24 @@ func ompKept(path string, e ompProviderEntry) any {
 	} else {
 		out["headers"] = headers
 	}
+	if len(hadDiscovery) > 0 && !ompOwnDiscovery(hadDiscovery) {
+		out["discovery"] = hadDiscovery
+	} else if e.Discovery == nil && ompOwnDiscovery(out["discovery"]) {
+		delete(out, "discovery")
+	}
 	return out
+}
+
+// ompOwnDiscovery says whether a discovery block in magpie's provider is
+// the one magpie writes (ompDiscovery): openai-models-list with
+// advertisedReasoning false and nothing else. A timeout, another type, or
+// advertisedReasoning left on is the user's.
+func ompOwnDiscovery(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok || len(m) != 2 || m["type"] != "openai-models-list" || m["advertisedReasoning"] != false {
+		return false
+	}
+	return true
 }
 
 // ompOwnOptions lists the models of the providers the user added to omp's

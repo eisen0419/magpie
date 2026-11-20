@@ -1209,8 +1209,7 @@ func wslAgentsOf(ds []distro) []*Agent {
 			k := wslKindOf("omp")
 			k.id, k.name = "omp#"+name, "omp · "+name
 			k.in = func(at place) *Agent {
-				return ompAt(at, at.join(".omp", "profiles", name, "agent"),
-					func() ompProviderEntry { return ompProviderAt(at.gw(), at.version) })
+				return ompAt(at, at.join(".omp", "profiles", name, "agent"), func() string { return at.version })
 			}
 			out = append(out, wslAgent(k, d))
 		}

@@ -106,13 +106,14 @@ func proxyBase(v, want string) (string, bool) {
 
 // loopbackWithPath says base is an http(s) address on this machine's
 // loopback with a path: a local proxy's route, never the gateway's own
-// address, which has none.
+// address (which has none) or its /agent/<id> path.
 func loopbackWithPath(base string) bool {
 	u, err := url.Parse(base)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || onAnotherMachine(base) {
 		return false
 	}
-	return strings.Trim(u.Path, "/") != ""
+	p := strings.Trim(u.Path, "/")
+	return p != "" && !strings.HasPrefix("/"+p+"/", gateway.AgentPath)
 }
 
 // reachesMagpie says v reaches magpie another way (proxyBase) whose root
