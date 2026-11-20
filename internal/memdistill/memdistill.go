@@ -91,6 +91,11 @@ type State struct {
 	// Done is each read session's last turn when it was read, by
 	// agent/id
 	Done map[string]time.Time `json:"done,omitempty"`
+	// DoneFiles is each gateway-backed session's snapshotted file sizes
+	// (day/file -> byte length) when it was read, by agent/id, so a turn
+	// appended after due() — even one stamped earlier than Done — still
+	// triggers a re-read.
+	DoneFiles map[string]map[string]int64 `json:"doneFiles,omitempty"`
 	// the last run: when, with which model, how many sessions read, how
 	// many memories proposed, and what stopped it
 	Last      time.Time `json:"last,omitzero"`
@@ -339,9 +344,16 @@ func runUpTo(ctx context.Context, auto string, complete Complete, limit int) (Re
 		for k, at := range res.done {
 			s.Done[k] = at
 		}
+		if len(res.doneFiles) > 0 && s.DoneFiles == nil {
+			s.DoneFiles = map[string]map[string]int64{}
+		}
+		for k, files := range res.doneFiles {
+			s.DoneFiles[k] = files
+		}
 		for k, at := range s.Done {
 			if forget(at, s.Since, res.oldest) {
 				delete(s.Done, k)
+				delete(s.DoneFiles, k)
 			}
 		}
 	})
@@ -350,7 +362,8 @@ func runUpTo(ctx context.Context, auto string, complete Complete, limit int) (Re
 
 type ran struct {
 	Result
-	done map[string]time.Time
+	done      map[string]time.Time
+	doneFiles map[string]map[string]int64
 	// oldest is the last turn of the oldest session listed, zero when
 	// none was
 	oldest time.Time
@@ -376,13 +389,80 @@ func listed() []sessions.Session {
 	return all[:min(len(all), Listed)]
 }
 
-// transcriptOf reads s where it is kept: a gateway-only session from what
-// the gateway recorded of it, any other from its agent's file.
+// gwOf holds each gateway-backed session's pinned recording snapshot from
+// due(). transcriptOf reads strictly within those file byte bounds, and
+// remember records those sizes in State.DoneFiles so later appends — even
+// turns stamped earlier than Done — wait for and trigger the next pass.
+var (
+	gwMu sync.Mutex
+	gwOf map[string]sessions.GatewaySnapshot
+)
+
+func noteGateway(s sessions.Session, snap sessions.GatewaySnapshot) {
+	gwMu.Lock()
+	if gwOf == nil {
+		gwOf = map[string]sessions.GatewaySnapshot{}
+	}
+	gwOf[key(s)] = snap
+	gwMu.Unlock()
+}
+
+func gatewayNoted(s sessions.Session) (sessions.GatewaySnapshot, bool) {
+	gwMu.Lock()
+	defer gwMu.Unlock()
+	snap, ok := gwOf[key(s)]
+	return snap, ok
+}
+
+// transcriptOf reads s where it is kept. A gateway-only session is what
+// the gateway recorded of it. So is a native session whose agent has no
+// transcript reader, when one of its gateway keys holds a recording
+// (recordedTurn): the file can't be read, and the gateway row was merged
+// away because the native one won. Read-only is the same when the agent
+// has no reader (Hermes, Alma). A read-only session with a reader
+// (Cursor's editor) stays on that reader. due's snapshot pins the exact
+// recording files and byte offsets that made the row due, so any turn
+// appended after due() waits for the next pass. Any other native session
+// is its agent's file.
 func transcriptOf(s sessions.Session) (sessions.Transcript, error) {
+	if snap, ok := gatewayNoted(s); ok {
+		return sessions.GatewayTranscriptSnapshot(snap)
+	}
 	if s.Gateway {
 		return sessions.GatewayTranscript(s.Agent, s.ID)
 	}
+	if snap, ok := recordedTurn(s, sessions.GatewayHearer()); ok {
+		return sessions.GatewayTranscriptSnapshot(snap)
+	}
 	return sessions.TranscriptOf(s)
+}
+
+// recordedTurn is the recording snapshot the gateway kept under one of s's
+// own gateway names (sessions.GatewaySame). Subagent and copy keys are
+// excluded so a subagent's recording never stands in for or masks the main
+// session. None when s is read from its own file or is itself a gateway
+// row. A read-only session with a reader (Cursor's editor) has one, so it
+// stays there. One without (Hermes, Alma) is read from the gateway when
+// one of its own keys was recorded. heard is sessions.GatewayHearer, stated
+// once for the pass.
+func recordedTurn(s sessions.Session, heard func(string, string) (sessions.GatewaySnapshot, bool)) (best sessions.GatewaySnapshot, ok bool) {
+	if s.Gateway || s.Transcript || heard == nil {
+		return
+	}
+	for _, k := range sessions.GatewaySame(s) {
+		a, i, cut := strings.Cut(k, "/")
+		if !cut || a == "" || i == "" {
+			continue
+		}
+		snap, yes := heard(a, i)
+		if !yes {
+			continue
+		}
+		if !ok || snap.Last.After(best.Last) {
+			best, ok = snap, true
+		}
+	}
+	return
 }
 
 // forget says a read session's mark, its last turn at, can go: the
@@ -396,21 +476,40 @@ func forget(at, since, oldest time.Time) bool {
 }
 
 // due are the sessions to read now, the latest first, and the last turn
-// of the oldest listed.
+// of the oldest listed. A native session with no transcript reader is
+// due when the gateway recorded it, read-only or not. The transcript is
+// only that recording, so the quiet wait and the mark are the recording's
+// newest turn, not the agent's file. The noted snapshot pins the exact
+// files and byte offsets observed here, so any turn appended afterwards
+// waits for the next pass.
 func due(st State, t time.Time) ([]sessions.Session, time.Time) {
 	var out []sessions.Session
 	var oldest time.Time
+	heard := sessions.GatewayHearer()
+	gwMu.Lock()
+	gwOf = map[string]sessions.GatewaySnapshot{}
+	gwMu.Unlock()
 	for _, s := range list() {
+		var backed bool
+		if s.Gateway {
+			if snap, ok := heard(s.Agent, s.ID); ok {
+				noteGateway(s, snap)
+			}
+		} else if snap, ok := recordedTurn(s, heard); ok {
+			backed = true
+			s.Last = snap.Last
+			noteGateway(s, snap)
+		}
 		if oldest.IsZero() || s.Last.Before(oldest) {
 			oldest = s.Last
 		}
 		switch {
-		case s.Agent == Agent, !s.Transcript,
+		case s.Agent == Agent, !s.Transcript && !backed,
 			s.ParentSession != "",
 			t.Sub(s.Last) < Quiet, s.Last.Before(st.Since):
 			continue
 		}
-		if at, ok := st.Done[key(s)]; ok && !s.Last.After(at) {
+		if marked(st, s) {
 			continue
 		}
 		out = append(out, s)
@@ -421,8 +520,55 @@ func due(st State, t time.Time) ([]sessions.Session, time.Time) {
 
 func key(s sessions.Session) string { return s.Agent + "/" + s.ID }
 
+// remember marks s read at its last turn (and snapshotted file sizes, when
+// gateway-backed) under every name its own gateway recording goes by
+// (sessions.GatewaySame), so a ZCode row listed later as sess_… is not
+// read again after the bare request id already was.
+func remember(done map[string]time.Time, doneFiles map[string]map[string]int64, s sessions.Session) {
+	snap, hasSnap := gatewayNoted(s)
+	for _, k := range sessions.GatewaySame(s) {
+		done[k] = s.Last
+		if hasSnap {
+			doneFiles[k] = snap.Sizes()
+		}
+	}
+}
+
+// snapshotCovered says every file in snap was already read at the same byte
+// length. An empty seen map is a pre-upgrade mark with no file snapshot and
+// falls back to the Done timestamp check.
+func snapshotCovered(snap sessions.GatewaySnapshot, seen map[string]int64) bool {
+	if len(seen) == 0 {
+		return true
+	}
+	for _, f := range snap.Files {
+		if n, ok := seen[f.Key]; !ok || f.Size != n {
+			return false
+		}
+	}
+	return true
+}
+
+// marked says s's recording was already read at a turn at least as new as
+// the one it holds now — and, when gateway-backed, at the same snapshotted
+// file sizes — under this row's id or another name of the same recording.
+func marked(st State, s sessions.Session) bool {
+	snap, hasSnap := gatewayNoted(s)
+	for _, k := range sessions.GatewaySame(s) {
+		at, ok := st.Done[k]
+		if !ok || s.Last.After(at) {
+			continue
+		}
+		if hasSnap && !snapshotCovered(snap, st.DoneFiles[k]) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func run(ctx context.Context, st State, model, effort string, complete Complete, limit int) (ran, error) {
-	r := ran{done: map[string]time.Time{}}
+	r := ran{done: map[string]time.Time{}, doneFiles: map[string]map[string]int64{}}
 	ss, oldest := due(st, now())
 	r.oldest = oldest
 	r.left = len(ss)
@@ -438,13 +584,17 @@ func run(ctx context.Context, st State, model, effort string, complete Complete,
 		doing.Add(1)
 		tr, err := read(s)
 		if err != nil {
-			// one that can't be read now is tried again when it changes
-			r.done[key(s)] = s.Last
+			// A failed read is unknown, not done: leave gateway-backed
+			// recordings unmarked so repairing or settling them retries
+			// even when the newest turn timestamp stays the same.
+			if _, gw := gatewayNoted(s); !gw && !s.Gateway {
+				remember(r.done, r.doneFiles, s)
+			}
 			continue
 		}
 		text, turns := transcript(tr)
 		if turns < MinTurns {
-			r.done[key(s)] = s.Last
+			remember(r.done, r.doneFiles, s)
 			continue
 		}
 		proj := memory.ProjectOf(s.Cwd)
@@ -457,7 +607,7 @@ func run(ctx context.Context, st State, model, effort string, complete Complete,
 			return r, fmt.Errorf("%s: %w", model, err)
 		}
 		r.Read++
-		r.done[key(s)] = s.Last
+		remember(r.done, r.doneFiles, s)
 		r.Added += keep(parse(reply), s, proj, said(tr))
 	}
 	return r, nil

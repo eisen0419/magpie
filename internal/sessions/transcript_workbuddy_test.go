@@ -27,10 +27,11 @@ func listedAgents(t *testing.T) []string {
 }
 
 // noTranscriptYet are agents the Sessions page lists whose conversations
-// are not read as a transcript, so "Learn from conversations"
-// (memdistill, which reads sessions.TranscriptOf) skips them. An agent
-// leaves this list when its reader is written, and may not be added to it
-// without one being filed.
+// are not read from the agent's own file. Learn from conversations reads
+// one from the gateway's record when one of its gateway keys was recorded,
+// including Hermes and Alma, which are listed read-only and have no
+// reader. An agent leaves this list when its reader is written, and may
+// not be added to it without one being filed.
 var noTranscriptYet = map[string]string{
 	"zcode":  "database rows",
 	"dsh":    "session.v3.jsonl not read as a transcript",
@@ -41,10 +42,11 @@ var noTranscriptYet = map[string]string{
 	"alma":   "database rows",
 }
 
-// Every agent the Sessions page lists is read by memory learning, or is
-// named in noTranscriptYet: a new session reader can't be left out of it
-// unseen (WorkBuddy's sessions showed on Sessions for weeks and were
-// never learned from, #feedback bxgz233).
+// Every agent the Sessions page lists has a transcript reader, or is
+// named in noTranscriptYet until one is written: a new session reader
+// can't be left out of it unseen (WorkBuddy's sessions showed on Sessions
+// for weeks and were never learned from, #feedback bxgz233). One named
+// here is not read from its own file.
 func TestEveryListedAgentHasATranscriptOrIsNamed(t *testing.T) {
 	for _, a := range listedAgents(t) {
 		_, parked := noTranscriptYet[a]

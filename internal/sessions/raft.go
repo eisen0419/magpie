@@ -3,6 +3,7 @@ package sessions
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/yetone/magpie/internal/appdir"
 )
@@ -92,4 +93,30 @@ func requestIDs(agent, id string) []string {
 		}
 	}
 	return []string{id}
+}
+
+// GatewaySame are the "agent/id" names of s's own gateway recording: the
+// row, and that same recording under a name GatewayKeys also gives it
+// (Raft's Pi, the app it ran in, ZCode's bare request id). A copy's or a
+// subagent's key is a different recording, so it is not included: a mark
+// on it would skip a conversation that was not read.
+func GatewaySame(s Session) []string {
+	own := map[string]bool{}
+	for _, id := range requestIDs(s.Agent, s.ID) {
+		own[id] = true
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, k := range GatewayKeys(s) {
+		agent, id, ok := strings.Cut(k, "|")
+		if !ok || agent == "" || id == "" || !own[id] || seen[agent+"/"+id] {
+			continue
+		}
+		seen[agent+"/"+id] = true
+		out = append(out, agent+"/"+id)
+	}
+	if len(out) == 0 && s.Agent != "" && s.ID != "" {
+		out = append(out, s.Agent+"/"+s.ID)
+	}
+	return out
 }

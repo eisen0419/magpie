@@ -310,6 +310,39 @@ func PruneGatewayConversations(now time.Time) error {
 	return nil
 }
 
+// GatewayFile pins one file in a gateway recording at the moment it was
+// observed: for turns.jsonl, Size is the complete-line byte offset; for a
+// legacy per-turn .json file, Size is the file's byte length.
+type GatewayFile struct {
+	Key  string
+	Path string
+	Size int64
+}
+
+// GatewaySnapshot pins a gateway recording as observed by GatewayHearer:
+// the owning gateway key (Agent, ID), the newest valid turn timestamp
+// within retention (Last), and the exact files and byte offsets present
+// when observed (Files).
+type GatewaySnapshot struct {
+	Agent      string
+	ID         string
+	Last       time.Time
+	Files      []GatewayFile
+	generation uint64
+}
+
+// Sizes returns a fresh map of each pinned file's Key to its observed Size.
+func (s GatewaySnapshot) Sizes() map[string]int64 {
+	if len(s.Files) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(s.Files))
+	for _, f := range s.Files {
+		out[f.Key] = f.Size
+	}
+	return out
+}
+
 // GatewayTranscript reads recent captured exchanges. Only a full matching
 // previous history prefix is removed, never equal text found elsewhere in a chat.
 func GatewayTranscript(agent, id string) (Transcript, error) {
@@ -320,9 +353,10 @@ func GatewayTranscript(agent, id string) (Transcript, error) {
 	gatewayMu.Lock()
 	defer gatewayMu.Unlock()
 	now := time.Now()
-	var paths []string
+	var files []GatewayFile
 	for d := 0; d <= 7; d++ {
-		dir := filepath.Join(gatewayDir(), now.UTC().AddDate(0, 0, -d).Format(time.DateOnly), gatewayIdentity(agent, id))
+		day := now.UTC().AddDate(0, 0, -d).Format(time.DateOnly)
+		dir := filepath.Join(gatewayDir(), day, gatewayIdentity(agent, id))
 		entries, err := os.ReadDir(dir)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -332,10 +366,35 @@ func GatewayTranscript(agent, id string) (Transcript, error) {
 		}
 		for _, e := range entries {
 			if e.Type().IsRegular() && (strings.HasSuffix(e.Name(), ".json") || e.Name() == "turns.jsonl") {
-				paths = append(paths, filepath.Join(dir, e.Name()))
+				files = append(files, GatewayFile{
+					Key:  day + "/" + e.Name(),
+					Path: filepath.Join(dir, e.Name()),
+				})
 			}
 		}
 	}
+	return readGatewayFiles(agent, id, files, now, false)
+}
+
+// GatewayTranscriptSnapshot reads only the files and byte bounds pinned in
+// snap. Turns appended after snap was observed — even one whose request
+// started earlier than snap.Last — lie beyond snap's bounds and wait for
+// the next pass.
+func GatewayTranscriptSnapshot(snap GatewaySnapshot) (Transcript, error) {
+	out := Transcript{Parts: []Part{}, Source: "gateway"}
+	if snap.Agent == "" || snap.ID == "" {
+		return out, errors.New("no such session")
+	}
+	gatewayMu.Lock()
+	defer gatewayMu.Unlock()
+	if snap.generation != 0 && snap.generation != gatewayGeneration {
+		return out, errors.New("gateway recording changed")
+	}
+	return readGatewayFiles(snap.Agent, snap.ID, snap.Files, time.Now(), true)
+}
+
+func readGatewayFiles(agent, id string, files []GatewayFile, now time.Time, pinned bool) (Transcript, error) {
+	out := Transcript{Parts: []Part{}, Source: "gateway"}
 	var turns []GatewayTurn
 	keep := func(turn GatewayTurn) {
 		if turn.Agent != agent || turn.Session != id || turn.Time.Before(now.Add(-GatewayRetention)) {
@@ -348,12 +407,12 @@ func GatewayTranscript(agent, id string) (Transcript, error) {
 			out.Cut = true
 		}
 	}
-	for _, path := range paths {
-		f, err := os.Open(path)
+	for _, gf := range files {
+		f, err := os.Open(gf.Path)
 		if err != nil {
 			return out, err
 		}
-		if strings.HasSuffix(path, ".jsonl") {
+		if strings.HasSuffix(gf.Path, ".jsonl") {
 			var info os.FileInfo
 			info, err = f.Stat()
 			if err != nil {
@@ -365,12 +424,29 @@ func GatewayTranscript(agent, id string) (Transcript, error) {
 				return out, errors.New("gateway session exceeds storage limit")
 			}
 			var end int64
-			end, err = gatewayCompleteSize(f, info.Size())
-			if err != nil {
-				f.Close()
-				return out, err
+			if pinned {
+				if gf.Size <= 0 || info.Size() < gf.Size {
+					f.Close()
+					return out, errors.New("gateway recording changed")
+				}
+				var last [1]byte
+				if _, err = f.ReadAt(last[:], gf.Size-1); err != nil {
+					f.Close()
+					return out, err
+				}
+				if last[0] != '\n' {
+					f.Close()
+					return out, errors.New("gateway recording changed")
+				}
+				end = gf.Size
+			} else {
+				end, err = gatewayCompleteSize(f, info.Size())
+				if err != nil {
+					f.Close()
+					return out, err
+				}
+				out.Cut = out.Cut || end != info.Size()
 			}
-			out.Cut = out.Cut || end != info.Size()
 			scan := bufio.NewScanner(io.LimitReader(f, end))
 			scan.Buffer(make([]byte, 64<<10), gatewayTurnMax+1)
 			for scan.Scan() {
@@ -384,6 +460,18 @@ func GatewayTranscript(agent, id string) (Transcript, error) {
 			err = scan.Err()
 		} else {
 			// Read the original per-turn files until their retention expires.
+			if pinned {
+				var info os.FileInfo
+				info, err = f.Stat()
+				if err != nil {
+					f.Close()
+					return out, err
+				}
+				if info.Size() != gf.Size {
+					f.Close()
+					return out, errors.New("gateway recording changed")
+				}
+			}
 			var data []byte
 			data, err = io.ReadAll(io.LimitReader(f, gatewayTurnMax+1))
 			var turn GatewayTurn
@@ -443,4 +531,195 @@ func GatewayTranscript(agent, id string) (Transcript, error) {
 		previous = append(slices.Clone(input), turn.Output...)
 	}
 	return out, nil
+}
+
+// gatewayUnheard is the answer when the store isn't there: asking about a
+// session reads no folder of it.
+func gatewayUnheard(string, string) (GatewaySnapshot, bool) { return GatewaySnapshot{}, false }
+
+// GatewayHearer reports, for each agent and session id, a pinned snapshot of
+// what magpie recorded of it within retention, and whether any valid turn was
+// recorded. The store is stated once: with nothing recorded, a session costs
+// no further read (a listing that stated each session's folder was most of
+// the Sessions page's time, #2278). A turn is stamped when its request starts
+// and appended when the request finishes, so the newest time is the maximum
+// over every completed turn across turns.jsonl and all legacy .json files,
+// not the last line or newest mtime. Any unreadable or corrupt file makes
+// the recording unknown (false) rather than partially valid. One pass
+// remembers each session it already opened.
+func GatewayHearer() func(agent, id string) (GatewaySnapshot, bool) {
+	root := gatewayDir()
+	st, err := os.Stat(root)
+	if err != nil || !st.IsDir() {
+		return gatewayUnheard
+	}
+	var mu sync.Mutex
+	type hit struct {
+		snap GatewaySnapshot
+		ok   bool
+	}
+	cache := map[string]hit{}
+	return func(agent, id string) (GatewaySnapshot, bool) {
+		if agent == "" || id == "" {
+			return GatewaySnapshot{}, false
+		}
+		k := agent + "\x00" + id
+		mu.Lock()
+		if v, ok := cache[k]; ok {
+			mu.Unlock()
+			return v.snap, v.ok
+		}
+		mu.Unlock()
+		snap, ok := gatewayHeard(root, agent, id)
+		mu.Lock()
+		if v, seen := cache[k]; seen {
+			mu.Unlock()
+			return v.snap, v.ok
+		}
+		cache[k] = hit{snap, ok}
+		mu.Unlock()
+		return snap, ok
+	}
+}
+
+func gatewayHeard(root, agent, id string) (GatewaySnapshot, bool) {
+	if agent == "" || id == "" {
+		return GatewaySnapshot{}, false
+	}
+	// The generation is the only shared state the scan needs. Directory
+	// reads and parsing stay outside gatewayMu, which a response's save
+	// also takes; a clear that bumps the generation drops this answer.
+	gatewayMu.Lock()
+	generation := gatewayGeneration
+	gatewayMu.Unlock()
+	now := time.Now().UTC()
+	cutoff := now.Add(-GatewayRetention)
+	var best time.Time
+	var files []GatewayFile
+	ok := false
+	for d := 0; d <= 7; d++ {
+		day := now.AddDate(0, 0, -d).Format(time.DateOnly)
+		dir := filepath.Join(root, day, gatewayIdentity(agent, id))
+		entries, err := os.ReadDir(dir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return GatewaySnapshot{}, false
+		}
+		for _, e := range entries {
+			if !e.Type().IsRegular() {
+				continue
+			}
+			name := e.Name()
+			if name != "turns.jsonl" && !strings.HasSuffix(name, ".json") {
+				continue
+			}
+			p := filepath.Join(dir, name)
+			at, size, yes, err := gatewayFileHeard(p, agent, id, cutoff)
+			if err != nil {
+				return GatewaySnapshot{}, false
+			}
+			if yes {
+				files = append(files, GatewayFile{Key: day + "/" + name, Path: p, Size: size})
+				if !ok || at.After(best) {
+					best, ok = at, true
+				}
+			}
+		}
+	}
+	gatewayMu.Lock()
+	cleared := generation != gatewayGeneration
+	gatewayMu.Unlock()
+	if cleared || !ok {
+		return GatewaySnapshot{}, false
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Key < files[j].Key })
+	return GatewaySnapshot{
+		Agent:      agent,
+		ID:         id,
+		Last:       best,
+		Files:      files,
+		generation: generation,
+	}, true
+}
+
+// gatewayFileHeard returns the newest valid turn time and pinned byte length
+// of path, or an error if the file cannot be read or contains corrupt JSON.
+func gatewayFileHeard(path, agent, id string, cutoff time.Time) (time.Time, int64, bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return time.Time{}, 0, false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return time.Time{}, 0, false, err
+	}
+	if strings.HasSuffix(path, ".jsonl") {
+		return gatewayJSONLHeard(f, info.Size(), agent, id, cutoff)
+	}
+	at, ok, err := gatewayJSONHeard(f, info.Size(), agent, id, cutoff)
+	return at, info.Size(), ok, err
+}
+
+func gatewayJSONHeard(f *os.File, size int64, agent, id string, cutoff time.Time) (time.Time, bool, error) {
+	if size <= 0 || size > gatewayTurnMax {
+		return time.Time{}, false, errors.New("unreadable gateway conversation")
+	}
+	buf := make([]byte, int(size))
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return time.Time{}, false, err
+	}
+	return heardTurn(buf, agent, id, cutoff)
+}
+
+func gatewayJSONLHeard(f *os.File, size int64, agent, id string, cutoff time.Time) (time.Time, int64, bool, error) {
+	if size > gatewaySessionMax {
+		return time.Time{}, 0, false, errors.New("gateway session exceeds storage limit")
+	}
+	end, err := gatewayCompleteSize(f, size)
+	if err != nil {
+		return time.Time{}, 0, false, err
+	}
+	if end == 0 {
+		return time.Time{}, 0, false, nil
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return time.Time{}, 0, false, err
+	}
+	scan := bufio.NewScanner(io.LimitReader(f, end))
+	scan.Buffer(make([]byte, 64<<10), gatewayTurnMax+1)
+	var best time.Time
+	ok := false
+	for scan.Scan() {
+		at, yes, err := heardTurn(scan.Bytes(), agent, id, cutoff)
+		if err != nil {
+			return time.Time{}, 0, false, err
+		}
+		if yes && (!ok || at.After(best)) {
+			best, ok = at, true
+		}
+	}
+	if err := scan.Err(); err != nil {
+		return time.Time{}, 0, false, err
+	}
+	return best, end, ok, nil
+}
+
+// heardTurn is buf's turn time when it is agent|id's and still kept, or an
+// error if buf is not valid JSON.
+func heardTurn(buf []byte, agent, id string, cutoff time.Time) (time.Time, bool, error) {
+	var turn struct {
+		Agent   string    `json:"agent"`
+		Session string    `json:"session"`
+		Time    time.Time `json:"time"`
+	}
+	if json.Unmarshal(buf, &turn) != nil {
+		return time.Time{}, false, errors.New("unreadable gateway conversation")
+	}
+	if turn.Agent != agent || turn.Session != id || turn.Time.IsZero() || turn.Time.Before(cutoff) {
+		return time.Time{}, false, nil
+	}
+	return turn.Time, true, nil
 }

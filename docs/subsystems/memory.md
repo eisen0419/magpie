@@ -251,11 +251,32 @@ further (`State.Since`), unless a range is picked.
   agents' own files, read-only ones included (the Antigravity app's,
   Cursor's editor's), and the sessions only the gateway recorded
   (`usage.ListedGateway`, as the page lists them), each read where it is
-  kept (`transcriptOf`, `sessions.GatewayTranscript` for a gateway-only
-  one). Before, only the files were read, and an agent seen only through
-  the gateway was never learnt from (bxgz233 on X: 1000+ WorkBuddy
-  sessions; `TestGatewayOnlySessionsRead`, `TestReadOnlySessionsRead`). A
-  gateway session with nothing recorded has no turns and is passed over.
+  kept (`transcriptOf`). A gateway-only session is read through
+  `sessions.GatewayTranscriptSnapshot` (falling back to
+  `sessions.GatewayTranscript` when no snapshot was noted). So is a native
+  session whose agent has no transcript reader (zcode, dsh, cline, grok,
+  droid, hermes, alma), read-only or not, when one of
+  `sessions.GatewaySame` holds a recording (excluding copy and subagent
+  keys). Quiet and the read mark follow that recording's newest completed
+  turn across `turns.jsonl` and legacy `.json` files, not the agent's
+  file, which has nothing readable. `due` pins the observed files and byte
+  offsets (`sessions.GatewaySnapshot`), `GatewayTranscriptSnapshot` stops
+  at those offsets, and `State.DoneFiles` remembers those sizes under
+  every `sessions.GatewaySame` alias so a turn appended after `due` (even
+  one with an older `turn.Time`) waits for and triggers the next pass,
+  while the same ZCode recording already read under its bare request id is
+  not read again when the files arrive as `sess_…`. Unreadable or corrupt
+  gateway recordings are treated as unknown and left unmarked so repairing
+  them retries. The file stays the one read when the agent has a reader,
+  including a read-only one (Cursor's editor). A native session with no
+  reader and no recording is left out, not marked failed.
+  Before, only the files were read, and an agent
+  seen only through the gateway was never learnt from, nor was one listed
+  natively with no reader (bxgz233 on X: 1000+ WorkBuddy sessions; #7372;
+  `TestGatewayOnlySessionsRead`, `TestReadOnlySessionsRead`,
+  `TestNativeSessionsWithoutReaderUseGateway`,
+  `TestListedNativeIsNotAlsoAGatewayRow`). A gateway session with nothing
+  recorded has no turns and is passed over.
 - What is sent: the conversation's user and assistant text only (no
   tools, no reasoning), cut to 24k characters keeping the head and the
   tail, plus the memories already kept for that project, under neutral

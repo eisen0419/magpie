@@ -1,6 +1,7 @@
 package sessions
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -61,6 +62,129 @@ func TestGatewayConversationClearAndReenableRejectsOldRequest(t *testing.T) {
 	}
 	if _, err := os.Stat(gatewayDir()); !os.IsNotExist(err) {
 		t.Fatal("old request resurrected cleared content")
+	}
+}
+
+func TestGatewayHearerLegacyJSONWithoutNewline(t *testing.T) {
+	gatewayHome(t)
+	at := time.Now().UTC().Truncate(time.Second)
+	dir := filepath.Join(gatewayDir(), at.Format(time.DateOnly), gatewayIdentity("pi", "s"))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := GatewayTurn{Agent: "pi", Session: "s", Time: at, Output: []Part{{Role: "assistant", Kind: "text", Text: "old"}}}
+	b, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b, []byte("\n")) {
+		t.Fatal("fixture gained a newline")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "old.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := GatewayHearer()("pi", "s")
+	if !ok || !got.Last.Equal(at) {
+		t.Fatalf("legacy json %+v ok=%v, want %v", got, ok, at)
+	}
+	tr, err := GatewayTranscriptSnapshot(got)
+	if err != nil || tr.Captured != 1 || tr.Parts[0].Text != "old" {
+		t.Fatalf("legacy content: %+v %v", tr, err)
+	}
+}
+
+func TestGatewayHearerMultipleLegacyJSONSameDay(t *testing.T) {
+	gatewayHome(t)
+	at := time.Now().UTC().Truncate(time.Second)
+	dir := filepath.Join(gatewayDir(), at.Format(time.DateOnly), gatewayIdentity("pi", "s"))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	newer := GatewayTurn{Agent: "pi", Session: "s", Time: at.Add(-time.Hour), Output: []Part{{Role: "assistant", Kind: "text", Text: "newer"}}}
+	older := GatewayTurn{Agent: "pi", Session: "s", Time: at.Add(-2 * time.Hour), Output: []Part{{Role: "assistant", Kind: "text", Text: "older"}}}
+	nb, err := json.Marshal(newer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ob, err := json.Marshal(older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newerPath := filepath.Join(dir, "01-newer.json")
+	olderPath := filepath.Join(dir, "02-older.json")
+	if err := os.WriteFile(newerPath, nb, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(olderPath, ob, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Earlier-started turn wrote later and has a newer mtime than the newer turn.
+	if err := os.Chtimes(newerPath, at.Add(-10*time.Minute), at.Add(-10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(olderPath, at.Add(-time.Minute), at.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := GatewayHearer()("pi", "s")
+	if !ok || !got.Last.Equal(newer.Time) || len(got.Files) != 2 {
+		t.Fatalf("heard %+v ok=%v, want Last=%v with 2 files", got, ok, newer.Time)
+	}
+	tr, err := GatewayTranscriptSnapshot(got)
+	if err != nil || tr.Captured != 2 {
+		t.Fatalf("snapshot transcript: %+v %v", tr, err)
+	}
+}
+
+func TestGatewayHearerUsesNewestTurnNotTheLastLine(t *testing.T) {
+	gatewayHome(t)
+	at := time.Now().UTC().Truncate(time.Second)
+	dir := filepath.Join(gatewayDir(), at.Format(time.DateOnly), gatewayIdentity("pi", "s"))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	newer := GatewayTurn{Agent: "pi", Session: "s", Time: at.Add(-time.Hour), Output: []Part{{Role: "assistant", Kind: "text", Text: "newer"}}}
+	older := newer
+	older.Time = at.Add(-2 * time.Hour)
+	older.Output[0].Text = "older"
+	nb, err := json.Marshal(newer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ob, err := json.Marshal(older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The request that started earlier finishes last, so it is the last line
+	// and its time is the older one.
+	body := append(append(nb, '\n'), ob...)
+	body = append(body, '\n')
+	if err := os.WriteFile(filepath.Join(dir, "turns.jsonl"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := GatewayHearer()("pi", "s")
+	if !ok || !got.Last.Equal(newer.Time) {
+		t.Fatalf("heard %+v ok=%v, want %v (last line is %v)", got, ok, newer.Time, older.Time)
+	}
+}
+
+func TestGatewayHearerRejectsCorruptJSONLLine(t *testing.T) {
+	gatewayHome(t)
+	at := time.Now().UTC().Truncate(time.Second)
+	dir := filepath.Join(gatewayDir(), at.Format(time.DateOnly), gatewayIdentity("pi", "s"))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	good := GatewayTurn{Agent: "pi", Session: "s", Time: at.Add(-time.Hour), Output: []Part{{Role: "assistant", Kind: "text", Text: "ok"}}}
+	gb, err := json.Marshal(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := append(append(gb, '\n'), []byte("{broken\n")...)
+	if err := os.WriteFile(filepath.Join(dir, "turns.jsonl"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := GatewayHearer()("pi", "s"); ok {
+		t.Fatalf("corrupt jsonl should be unknown, got %+v", got)
 	}
 }
 
