@@ -60,8 +60,9 @@ type busyTry struct {
 
 // busy says whether a failure is one a member may be over in a moment:
 // overloaded, unavailable, timed out, or a rate limit that isn't the
-// plan's or the money's, nor an account's token wall (walled). A proxy
-// that refused the connection, a quota used up, response protection's
+// plan's or the money's (momentRate: payment advice on a TPM limit
+// still is), nor an account's token wall (walled). A proxy that
+// refused the connection, a quota used up, response protection's
 // 502, a void cut at its length (cutVoidWords, #2972), an upstream
 // that answered a stream request with a whole reply (didNotStream), or
 // the Qoder plugin's queue answer (queued) isn't: each fails the same
@@ -74,9 +75,26 @@ func busy(status int, body []byte) bool {
 			!bodyHas(body, cutVoidWords) &&
 			!queued(body)
 	case status == 429:
-		return failure(status, body) == failRate && !creditWords.Match(wordsOf(body)) && !walled(body)
+		return momentRate(status, body)
 	}
 	return false
+}
+
+// momentRate says a 429 is a rate limit a moment may clear, so the
+// same-one retries (passing) and a group's patience (busy) both ask
+// again. OpenAI ends a TPM 429 with advice to add a payment method and
+// a link to account/billing. creditWords matches payment and billing,
+// and the limit was handed to the agent instead of waited out (#7274).
+// A per-minute limit (minuteRate) is still one, advice included. The
+// balance itself spent is not a minute's limit (brokeWords). Any other
+// creditWords on a 429, and an account's token wall (walled), are not
+// cleared by asking again.
+func momentRate(status int, body []byte) bool {
+	if failure(status, body) != failRate || walled(body) {
+		return false
+	}
+	words := wordsOf(body)
+	return !creditWords.Match(words) || minuteRate(words)
 }
 
 // queuedWords matches the 503 the Qoder plugin answers when Qoder put a
