@@ -2555,7 +2555,9 @@ func (p Provider) vendorListPrice(model string) (catalog.Price, bool) {
 // pluginListPrice is the price the plugin serving p lists model at
 // (pluginPrice): Devin's own, from GetCliModelConfigs, for its SWE models
 // that no catalog has. Only where no catalog prices the model, as with
-// pluginFree, so no price a catalog gave changes.
+// pluginFree, so no price a catalog gave changes. A Claude -fast id
+// models.dev doesn't list keeps the plugin's input, output and cache
+// read, and a cache write left at 0 is filled from the base (claudeFastWrites).
 func (p Provider) pluginListPrice(model string) (catalog.Price, bool) {
 	pp, ok := PluginOf(p.ID)
 	if !ok {
@@ -2565,7 +2567,132 @@ func (p Provider) pluginListPrice(model string) (catalog.Price, bool) {
 	if !ok {
 		return catalog.Price{}, false
 	}
-	return pluginPrice(m)
+	pr, ok := pluginPrice(m)
+	if !ok {
+		return catalog.Price{}, false
+	}
+	return claudeFastWrites(m.ID, pr), true
+}
+
+// claudeFastWindow strips a trailing context-window tag (@1m, @1.5m, @300k,
+// [1m], [1.5m]) from a Claude -fast plugin id before matching -fast.
+var claudeFastWindow = lazyre.New(`^(.*?)(?:@[0-9]+(?:\.[0-9]+)?[km]|\[[0-9]+(?:\.[0-9]+)?[km]\])$`)
+
+// claudeFastWrites fills a Claude -fast model's cache-write prices
+// when the plugin left them at 0 (#7360). Devin's GetCliModelConfigs says
+// write 0 for every model. A base Claude id is priced from models.dev
+// before the plugin, so its writes are Anthropic's; a -fast id is not
+// listed there, and the plugin's 0 was what a cached session was counted
+// at. The plugin's input, output and cache read stay — they are already
+// the fast rate it reports, at 2×, 6× or a rate of its own. The missing
+// writes are Anthropic's base model's (anthropicListPrice), times how many
+// times that input is the base's, the 1-hour write with them. A write
+// outside 0 is kept, and looking up only Anthropic's catalog keeps a
+// non-Claude -fast id — including a relay's "claude-" prefix such as
+// claude-gpt-6-sol-fast — untouched. No long-context tier is added: the
+// plugin listed one input price, and Anthropic's fast mode is that
+// multiple across the whole window.
+func claudeFastWrites(model string, pr catalog.Price) catalog.Price {
+	if pr.CacheWrite != 0 || !(pr.Input > 0) || math.IsInf(pr.Input, 0) {
+		return pr
+	}
+	base, ok := claudeFastBase(model)
+	if !ok {
+		return pr
+	}
+	std, ok := anthropicListPrice(base)
+	if !ok || !(std.Input > 0) || math.IsInf(std.Input, 0) || !(std.CacheWrite > 0) {
+		return pr
+	}
+	r := pr.Input / std.Input
+	cand := pr
+	cand.CacheWrite = std.CacheWrite * r
+	cand.CacheWrite1h = std.CacheWrite1h * r
+	if cand.CacheWrite1h == 0 {
+		catalog.OneHourFor(base, &cand)
+	}
+	if math.IsInf(cand.CacheWrite, 0) || math.IsNaN(cand.CacheWrite) || math.IsInf(cand.CacheWrite1h, 0) || math.IsNaN(cand.CacheWrite1h) {
+		return pr
+	}
+	return cand
+}
+
+// claudeFastBase is the model a Claude -fast id is the fast run of
+// (claude-opus-5-5-fast, claude-opus-4.8-fast, claude-opus-5-5-high-fast,
+// claude-opus-5-5-max-fast, claude-opus-5-5-fast@1m, claude-opus-5-5-fast[1.5m]),
+// and whether it is one. Anything that does not name a Claude model is not one.
+func claudeFastBase(model string) (string, bool) {
+	id := strings.ToLower(strings.TrimSpace(model))
+	if i := strings.LastIndex(id, "/"); i >= 0 {
+		id = id[i+1:]
+	}
+	if m := claudeFastWindow.FindStringSubmatch(id); m != nil {
+		id = m[1]
+	}
+	base, ok := strings.CutSuffix(id, "-fast")
+	if !ok || !strings.Contains(base, "claude") {
+		return "", false
+	}
+	return base, true
+}
+
+// anthropicListPrice looks up a Claude base model in Anthropic's own
+// models.dev catalog only, so a relay's "claude-" prefix on a non-Claude
+// model (claude-gpt-6-sol-fast) is never priced from OpenAI, Kimi or
+// MiniMax or given Anthropic's 1-hour cache-write rate. Exact ids match
+// first; then Claude/Devin's -max, -min, -none and -thinking variants and
+// catalog.SameModel snapshot-date normalization are tried as fallbacks.
+func anthropicListPrice(base string) (catalog.Price, bool) {
+	return anthropicListPriceSeen(base, map[string]bool{})
+}
+
+func anthropicListPriceSeen(base string, seen map[string]bool) (catalog.Price, bool) {
+	if base == "" || seen[base] {
+		return catalog.Price{}, false
+	}
+	seen[base] = true
+	anthropic := []string{"anthropic"}
+	names := pricedNames(base)
+	for _, m := range names {
+		if pr, ok := catalog.PricedBy(anthropic, m); ok {
+			return pr, true
+		}
+	}
+	for _, m := range names {
+		if stripped, ok := claudeVariantBase(m); ok {
+			if pr, ok := anthropicListPriceSeen(stripped, seen); ok {
+				return pr, true
+			}
+		}
+	}
+	for _, m := range names {
+		if same := catalog.SameModel(m); same != "" && same != m {
+			if pr, ok := anthropicListPriceSeen(same, seen); ok {
+				return pr, true
+			}
+		}
+	}
+	if f, ok := mythosFable(base); ok {
+		return anthropicListPriceSeen(f, seen)
+	}
+	return catalog.Price{}, false
+}
+
+func claudeVariantBase(id string) (string, bool) {
+	i := strings.LastIndexByte(id, '-')
+	if i <= 0 {
+		return "", false
+	}
+	base, suffix := id[:i], id[i+1:]
+	switch suffix {
+	case "max", "min", "none", "thinking":
+	default:
+		return "", false
+	}
+	if !strings.ContainsAny(base, "0123456789") {
+		return "", false
+	}
+	return base, true
 }
 
 // pluginFree is whether the plugin serving p lists model as one its plan
