@@ -500,8 +500,11 @@ func First(best, n int) []int {
 // out of. Among the paid, the listed order stands rather than Smart's
 // renewal-weighted one, because what this routing is for is the free tier;
 // set a provider's own routing (Smart, in order, weekly pace) if the paid
-// seats should be spent smartly among themselves — a provider or group in
-// this group keeps its own routing either way.
+// seats should be spent smartly among themselves. A provider that sets its
+// own routing keeps it. A group that sets its own routing keeps it and is
+// tried whole, even when that routing is Free first too; one left on Quota
+// first ("") is weighed seat by seat with this group, so a paid seat of
+// that child does not ride ahead of a sibling group's free seat (#7325).
 //
 // A seat whose model costs nothing nowhere is not free: it goes with the
 // paid ones, so a routing set on a pool without free models behaves as In
@@ -598,8 +601,9 @@ func Expires(s Seat) time.Time {
 // same, so a rate's rounding doesn't reorder providers billing alike.
 //
 // Like FreeFirst it orders one tier only: a member's allowance, rests and
-// failover are as for every routing, and a provider or group in the group
-// routed its own way keeps it.
+// failover are as for every routing. A provider that sets its own routing
+// keeps it, and so does a group that sets its own, even the same Cheapest;
+// one left on Quota first ("") is weighed seat by seat with this group.
 var Cheapest = Strategy{ByPrice: true, Order: func(_ string, seats []Seat) []int {
 	idx := identity(len(seats))
 	sort.SliceStable(idx, func(a, b int) bool {

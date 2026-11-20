@@ -120,15 +120,27 @@ func (g Group) Live() Group {
 }
 
 // Within is g, a group in the group in, as in routes it: one left on the
-// default (Smart) is routed as in is, as a provider left on the default
-// is weighed with the group it is in (ownRouting, #3847, mycf_711) —
-// Free first on the outer group reaches the seats of a group in it that
-// says nothing of its own. One that sets a routing keeps it (#576), and
-// so does every one in a group In order, By weight or Manual: those try
-// each member whole, by its own routing, as they do a provider's keys.
+// default (Smart, Routing "") gets FromDefault set so the gateway can tell
+// it from a group the user set to a routing, and is routed as in is when in
+// pools (and back to "" when re-applied under a parent that does not pool,
+// such as after a gateway key changes the outer group's routing). A
+// provider left on the default is weighed with the group it is in
+// (ownRouting, #3847, mycf_711), and so is a group left on the default when
+// the parent pools (joinsPool, #7325) — Free first on the outer group
+// reaches the seats of a group in it that says nothing of its own. One that
+// sets a routing keeps it (#576), even when it is the same as the parent's
+// (In turn inside In turn, Free quota by expiry inside Free quota by
+// expiry), and so does every one in a group In order, By weight or Manual:
+// those try each member whole, by its own routing, as they do a provider's
+// keys.
 func (g Group) Within(in Group) Group {
-	if g.Routing == "" && pools(in.Routing) {
-		g.Routing = in.Routing
+	if g.Routing == "" || g.FromDefault {
+		g.FromDefault = true
+		if pools(in.Routing) {
+			g.Routing = in.Routing
+		} else {
+			g.Routing = ""
+		}
 	}
 	return g
 }
@@ -223,9 +235,15 @@ type Group struct {
 	// matched drops out (placedIn). Empty when it is the order the group
 	// has unasked, its own members first, then the matched. Saved, it
 	// places the matched; the named go in Members' order (placedOver).
-	Placed   []string `json:"placed,omitempty"`
-	Routing  string   `json:"routing,omitempty"`  // as Provider.Routing, over all the members' keys and accounts; or Manual
-	Affinity string   `json:"affinity,omitempty"` // as Provider.Affinity
+	Placed  []string `json:"placed,omitempty"`
+	Routing string   `json:"routing,omitempty"` // as Provider.Routing, over all the members' keys and accounts; or Manual
+	// FromDefault is set by Within when the saved Routing was still "".
+	// Not stored: the saved routing stays "", and a group the user set to
+	// a routing reads false, so Within can re-apply a changed parent
+	// routing (such as a gateway key's) and joinsPool can tell a default
+	// child apart from an explicit one with the same routing (#7325).
+	FromDefault bool   `json:"-"`
+	Affinity    string `json:"affinity,omitempty"` // as Provider.Affinity
 	// RoutedAt is when the user last changed Routing (SaveGroup): a
 	// conversation the group last answered before it is routed the new
 	// way at its next turn under Stays: Auto, whatever its old member

@@ -782,7 +782,8 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 			if keyHeld {
 				keeps = groupKeeps(keyWho, g, ms)
 			}
-			t := s.drawingTries(keyRouted(access.Caller(r.Context()), g), ms, keeps, drawsModel)
+			g = keyRouted(access.Caller(r.Context()), g)
+			t := s.drawingTries(g, ms, keeps, drawsModel)
 			if len(t) == 0 && keeps != nil {
 				fail(keyGroupRefusal(w, keyWho, d.Model, ms))
 				return

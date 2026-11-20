@@ -111,7 +111,8 @@ func TestInOrderStillGoesByTheListOverTheFreeOne(t *testing.T) {
 // as the group it is in, as a provider left on the default is (#3847,
 // mycf_711): its free seat goes first and says Free, and the trace's
 // group in the group says Free first, so the Routing page reads it as
-// such. One that sets its own routing keeps it.
+// such. One that sets its own routing keeps it, even when that routing
+// is Free first too.
 func TestFreeFirstReachesAGroupInItLeftOnTheDefault(t *testing.T) {
 	fresh(t)
 	vendor := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

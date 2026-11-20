@@ -1158,7 +1158,8 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 		if keyHeld {
 			keeps = groupKeeps(keyWho, g, ms)
 		}
-		t := s.drawingTries(keyRouted(access.Caller(r.Context()), g), ms, keeps, servesKind(provider.KindVideo))
+		g = keyRouted(access.Caller(r.Context()), g)
+		t := s.drawingTries(g, ms, keeps, servesKind(provider.KindVideo))
 		if len(t) == 0 && keeps != nil {
 			fail(keyGroupRefusal(w, keyWho, f.Model, ms))
 			return

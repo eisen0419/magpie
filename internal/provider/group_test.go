@@ -185,3 +185,39 @@ func TestAutoGroupsEditionTwins(t *testing.T) {
 		t.Errorf("the user's own same-as lost: %+v", gs)
 	}
 }
+
+func TestGroupWithinReapplied(t *testing.T) {
+	// A default child ("") stamps FromDefault even under a non-pooling parent,
+	// so re-applying Within against a pooling or non-pooling effective parent
+	// (such as after keyRouted) updates its lent routing cleanly.
+	child := Group{ID: "a"}
+	underOrder := child.Within(Group{ID: "p", Routing: Ordered})
+	if !underOrder.FromDefault || underOrder.Routing != "" {
+		t.Fatalf("under Ordered: got Routing=%q FromDefault=%v, want \"\" true", underOrder.Routing, underOrder.FromDefault)
+	}
+	underExpiring := underOrder.Within(Group{ID: "p", Routing: FreeExpiring})
+	if !underExpiring.FromDefault || underExpiring.Routing != FreeExpiring {
+		t.Fatalf("re-applied under FreeExpiring: got Routing=%q FromDefault=%v, want %q true", underExpiring.Routing, underExpiring.FromDefault, FreeExpiring)
+	}
+	underPace := underExpiring.Within(Group{ID: "p", Routing: Pace})
+	if !underPace.FromDefault || underPace.Routing != Pace {
+		t.Fatalf("re-applied under Pace: got Routing=%q FromDefault=%v, want %q true", underPace.Routing, underPace.FromDefault, Pace)
+	}
+	backToOrder := underPace.Within(Group{ID: "p", Routing: Ordered})
+	if !backToOrder.FromDefault || backToOrder.Routing != "" {
+		t.Fatalf("re-applied back to Ordered: got Routing=%q FromDefault=%v, want \"\" true", backToOrder.Routing, backToOrder.FromDefault)
+	}
+	backToSmart := underPace.Within(Group{ID: "p", Routing: ""})
+	if !backToSmart.FromDefault || backToSmart.Routing != "" {
+		t.Fatalf("re-applied back to Smart: got Routing=%q FromDefault=%v, want \"\" true", backToSmart.Routing, backToSmart.FromDefault)
+	}
+
+	// An explicit child never sets FromDefault and never changes Routing.
+	explicit := Group{ID: "b", Routing: FreeExpiring}
+	for _, parent := range []string{"", Ordered, FreeExpiring, Pace, Weighted, Manual} {
+		got := explicit.Within(Group{ID: "p", Routing: parent})
+		if got.FromDefault || got.Routing != FreeExpiring {
+			t.Fatalf("explicit child under %q: got Routing=%q FromDefault=%v, want %q false", parent, got.Routing, got.FromDefault, FreeExpiring)
+		}
+	}
+}

@@ -222,8 +222,11 @@ type Key struct {
 	// X): RoutingSmart, one of provider's group routings but Manual, or a
 	// plugin's
 	// "<plugin>/<name>"; "" follows the group's own. A manual group
-	// still sends to its pick, and a group in the group, or a provider
-	// routed its own way in it, keeps its own routing, as always.
+	// still sends to its pick. A group in the group that sets its own
+	// routing keeps it, even when it matches; one left on Quota first is
+	// weighed seat by seat with the key's. A provider routed its own way
+	// keeps its routing; one on Quota first, or routed as the group is,
+	// is pooled with it.
 	Routing string `json:"routing,omitempty"`
 }
 

@@ -691,12 +691,18 @@ func planFallbackGroup(g provider.Group, ms []provider.Member, from provider.Pro
 // member, each as its own provider's routing orders it; else all as one,
 // so a subscription whose allowance renews soonest goes first whichever
 // provider it is of, but for a provider set to route another way, which
-// is planned as a group in the group is (ownRouting). A group in the group is planned by its own routing
-// alone, whatever the group's (#576): in order, in its place; else as
-// one, weighed with the rest by the one it would try first, and tried
-// whole where that one goes — the group's routing picks between its
-// groups, never within them. A group in the group sinks by its own Sink
-// too, within its own order (#2255), before g's Sink orders the whole.
+// is planned as a group in the group is (ownRouting). A group in the group
+// that sets its own routing is planned by that alone (#576), even when
+// that routing is g's: in order, in its place; else as one, weighed by the
+// seat it would try first, and tried whole. One left on the default joins
+// the pool (joinsPool, #7325): its seats are weighed with the group's, so
+// under Free quota by expiry a credit lost in six hours goes before a
+// quota that resets in a day in another group, ahead of a sibling whose
+// window lasts longer. Use before expiry weighs those same seats by loss
+// per hour, which need not be that order. A group in the group sinks by
+// its own Sink too, within its own order (#2255), before g's Sink orders
+// the whole, and one that sinks is tried whole even when it would
+// otherwise join.
 // A member's fallbacks are not the group's.
 func (s *Server) planGroup(g provider.Group, ms []provider.Member, from provider.Protocol) ([]candidate, planned) {
 	pl := planned{routing: g.Routing, grouped: true}
@@ -817,8 +823,10 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 	}
 	if routingOf(g.Routing) != provider.Ordered {
 		// what the group weighs: each of its models' keys or accounts,
-		// and each group in it as one — planned by its own routing, put
-		// where the one it would try first is, the rest of it after
+		// and each group in it that keeps its own routing as one — planned
+		// by that routing, put where the one it would try first is, the
+		// rest of it after. A group left on the default joins the pool.
+		// One that sets its own routing, even the same as g's, stays one unit.
 		type unit struct {
 			m      provider.Member // the model, for one of its keys
 			cs     []candidate     // a group in g, or a provider routed its own way: its own order
@@ -835,50 +843,64 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 			at[head.seat()] = append(at[head.seat()], len(units))
 			units, heads = append(units, u), append(heads, head)
 		}
-		for i := 0; i < len(ms); {
-			m := ms[i]
-			if len(m.Path) > depth+1 {
-				j := i + 1
-				for j < len(ms) && len(ms[j].Path) > depth+1 && ms[j].Path[depth] == m.Path[depth] {
-					j++
+		// walk adds ms, the models depth groups down, to the pool. A group
+		// there that joins it is walked into, so a group in that group is
+		// too; the member list is finite and depth only grows, and a group
+		// that would contain itself was cut when the members were listed.
+		var walk func(ms []provider.Member, depth int)
+		walk = func(ms []provider.Member, depth int) {
+			for i := 0; i < len(ms); {
+				m := ms[i]
+				if len(m.Path) > depth+1 {
+					j := i + 1
+					for j < len(ms) && len(ms[j].Path) > depth+1 && ms[j].Path[depth] == m.Path[depth] {
+						j++
+					}
+					child := m.Via[depth].Within(g)
+					if joinsPool(child, g) {
+						walk(ms[i:j], depth+1)
+						i = j
+						continue
+					}
+					var sub planned
+					cs := planLevel(child, ms[i:j], depth+1, from, &sub, asides, wAsides, hold)
+					cs, sub.order = sinkOwn(child, cs, sub.order)
+					pl.left = append(pl.left, sub.left...)
+					pl.capped = append(pl.capped, sub.capped...)
+					pl.unlisted = append(pl.unlisted, sub.unlisted...)
+					pl.unlistedW = append(pl.unlistedW, sub.unlistedW...)
+					if len(cs) > 0 {
+						add(unit{cs: cs, order: sub.order, member: m.Path[depth]}, firstAwake(cs))
+					}
+					i = j
+					continue
 				}
-				var sub planned
-				cs := planLevel(m.Via[depth], ms[i:j], depth+1, from, &sub, asides, wAsides, hold)
-				cs, sub.order = sinkOwn(m.Via[depth], cs, sub.order)
-				pl.left = append(pl.left, sub.left...)
-				pl.capped = append(pl.capped, sub.capped...)
-				pl.unlisted = append(pl.unlisted, sub.unlisted...)
-				pl.unlistedW = append(pl.unlistedW, sub.unlistedW...)
-				if len(cs) > 0 {
-					add(unit{cs: cs, order: sub.order, member: m.Path[depth]}, firstAwake(cs))
+				if ownRouting(m.Provider, g) || byWeight {
+					// a provider routed its own way keeps it, as a group
+					// in the group does: weighed as one by the first it
+					// would try, and tried whole in its own order (kchen0x
+					// on X: Antigravity in order inside a Smart group)
+					cs, wg := weigh(m.Provider, keys(m), m.Model, from)
+					var order []Weighed
+					for k, c := range cs {
+						w := weighed(c, m.Provider, wg, false, from)
+						w.Turn = k == 0 && goesRound(m.Provider.Routing) && len(cs) > 1
+						w.Via = m.Groups()
+						order = append(order, w)
+					}
+					if len(cs) > 0 {
+						add(unit{cs: cs, order: order, member: m.Path[depth]}, firstAwake(cs))
+					}
+					i++
+					continue
 				}
-				i = j
-				continue
-			}
-			if ownRouting(m.Provider, g) || byWeight {
-				// a provider routed its own way keeps it, as a group
-				// in the group does: weighed as one by the first it
-				// would try, and tried whole in its own order (kchen0x
-				// on X: Antigravity in order inside a Smart group)
-				cs, wg := weigh(m.Provider, keys(m), m.Model, from)
-				var order []Weighed
-				for k, c := range cs {
-					w := weighed(c, m.Provider, wg, false, from)
-					w.Turn = k == 0 && goesRound(m.Provider.Routing) && len(cs) > 1
-					w.Via = m.Groups()
-					order = append(order, w)
-				}
-				if len(cs) > 0 {
-					add(unit{cs: cs, order: order, member: m.Path[depth]}, firstAwake(cs))
+				for _, c := range keys(m) {
+					add(unit{m: m}, c)
 				}
 				i++
-				continue
 			}
-			for _, c := range keys(m) {
-				add(unit{m: m}, c)
-			}
-			i++
 		}
+		walk(ms, depth)
 		if byWeight {
 			members := make([]string, len(units))
 			for i, u := range units {
@@ -934,10 +956,11 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 			for j < len(ms) && len(ms[j].Path) > depth+1 && ms[j].Path[depth] == m.Path[depth] {
 				j++
 			}
+			child := m.Via[depth].Within(g)
 			at := len(pl.order)
-			cs := planLevel(m.Via[depth], ms[i:j], depth+1, from, pl, asides, wAsides, hold)
+			cs := planLevel(child, ms[i:j], depth+1, from, pl, asides, wAsides, hold)
 			var order []Weighed
-			cs, order = sinkOwn(m.Via[depth], cs, pl.order[at:])
+			cs, order = sinkOwn(child, cs, pl.order[at:])
 			pl.order = append(pl.order[:at], order...)
 			out = append(out, cs...)
 			i = j
@@ -990,6 +1013,25 @@ func firstAwake(cs []candidate) candidate {
 // as the user set it, whatever g's routing.
 func ownRouting(p provider.Provider, g provider.Group) bool {
 	return p.Routing != "" && p.Routing != g.Routing
+}
+
+// joinsPool: sub, a group in g, is weighed seat by seat with g. g pools,
+// and sub was left on Quota first ("") so Within lent it g's routing and
+// set FromDefault (#3847, #7325). Matching routing is not enough: a child
+// the user set to the same routing — In turn inside In turn, Free quota
+// by expiry inside Free quota by expiry — stays one unit (#576). One that
+// sinks is tried whole too, so its Sink still orders its own seats
+// (#2255). A parent In order, By weight, Manual or still on Quota first
+// tries each member whole.
+func joinsPool(sub, g provider.Group) bool {
+	switch g.Routing {
+	case "", provider.Ordered, provider.Weighted, provider.Manual:
+		return false
+	}
+	if sinks(sub.Sinks(), sub.Routing) {
+		return false
+	}
+	return sub.FromDefault
 }
 
 // capHeld is how the account acct of p is held at its usage cap for

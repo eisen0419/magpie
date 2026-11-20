@@ -289,13 +289,14 @@ func groupRef(g provider.Group, ms []provider.Member) *GroupRef {
 			ref.Fast = append(ref.Fast, ref.Members[len(ref.Members)-1])
 		}
 		ref.Via = append(ref.Via, strings.Join(m.Groups(), ">"))
-		in := g.ID
+		in := g
 		for _, v := range m.Via {
+			v = v.Within(in)
 			if !seen[v.ID] {
 				seen[v.ID] = true
-				ref.Subs = append(ref.Subs, SubGroup{ID: v.ID, Ref: v.Ref(), Name: v.Name, Routing: v.Routing, In: in, Rules: len(v.Rules)})
+				ref.Subs = append(ref.Subs, SubGroup{ID: v.ID, Ref: v.Ref(), Name: v.Name, Routing: v.Routing, In: in.ID, Rules: len(v.Rules)})
 			}
-			in = v.ID
+			in = v
 		}
 	}
 	if len(ref.Subs) == 0 {
