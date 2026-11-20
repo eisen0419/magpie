@@ -57,6 +57,34 @@ func pinnedHost() string {
 	return h
 }
 
+// Here reports whether host is this computer as the gateway is reached:
+// loopback (localhost, 127.0.0.1, ::1), an unspecified address (0.0.0.0,
+// ::), the host MAGPIE_ADDR pins, or an address of an interface that is up.
+func Here(host string) bool {
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && (ip.IsLoopback() || ip.IsUnspecified()) {
+		return true
+	}
+	if ph := pinnedHost(); ph != "" && strings.EqualFold(host, ph) {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, have := range hostIPs() {
+		if have.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // Port is the gateway's port.
 func Port() string {
 	_, p, err := net.SplitHostPort(Addr())

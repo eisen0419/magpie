@@ -39,8 +39,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	urlpath "path"
 	"slices"
 	"sort"
 	"strings"
@@ -243,7 +245,7 @@ func (l *Library) hubServers(agentID string) []*Server {
 				on = true
 			}
 		}
-		if on && inHub(s, id) {
+		if on && inHub(s, id) && !ownHub(s) {
 			out = append(out, s)
 		}
 	}
@@ -295,8 +297,10 @@ func visitorServers(ctx context.Context, ss []*Server) []*Server {
 func (theHub) Tools(ctx context.Context, agentID string) []gateway.HubTool {
 	ss := visitorServers(ctx, hubServers(agentID))
 	if gateway.FromRouter(ctx) {
-		// another magpie's router: not given a Remote magpie's back
-		ss = slices.DeleteFunc(ss, func(s *Server) bool { return s.Bridge != "" })
+		// another magpie's router: not given a Remote magpie's back, nor
+		// this hub under the host the request came in on (ownHub already
+		// took the addresses known to be this computer's)
+		ss = slices.DeleteFunc(ss, func(s *Server) bool { return s.Bridge != "" || routerLoop(ctx, s) })
 	}
 	lists := make([][]gateway.HubTool, len(ss))
 	var wg sync.WaitGroup
@@ -351,6 +355,9 @@ func (theHub) Call(ctx context.Context, agentID, server, tool string, args json.
 	if s.Bridge != "" && gateway.FromRouter(ctx) {
 		return nil, errors.New("it is another magpie's router, which isn't run for a magpie's router")
 	}
+	if routerLoop(ctx, s) {
+		return nil, errors.New("it is this magpie's own MCP hub, which isn't run again from the hub")
+	}
 	if slices.Contains(s.DisabledTools, tool) {
 		return nil, errors.New("the tool is turned off in magpie's Library")
 	}
@@ -368,6 +375,174 @@ func (theHub) Call(ctx context.Context, agentID, server, tool string, args json.
 		return pluginHubCall(ctx, gateway.HubAgentOf(agentID), s, tool, args)
 	}
 	return backendOf(s).call(ctx, tool, args, meta)
+}
+
+// ownHub is whether s is this magpie's own MCP hub. The hub lists every
+// server ticked for an agent and asks each for its tools; one of them at
+// this hub asks the hub, and the names nest until the client cuts them
+// off (#7305). It is either this gateway's public URL (MAGPIE_PUBLIC_URL
+// or LAZYCAT_APP_DOMAIN, including a reverse-proxied port or base path)
+// with the hub path beneath it, or a hub URL at this gateway's port on
+// loopback (localhost, 127.0.0.1, ::1), an unspecified address, an
+// address of this computer, or the host MAGPIE_ADDR pins. A hub at
+// another host or another port is another magpie's and is kept. The
+// server stays in the library; it is only left out of what the hub lists
+// and runs, and out of the servers found in agents (foundServersOf).
+func ownHub(s *Server) bool {
+	if s == nil || !s.Remote() {
+		return false
+	}
+	u, err := url.Parse(strings.TrimSpace(s.URL))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if publicHub(u) {
+		return true
+	}
+	if !hubPathOf(u.Path) || urlPort(u) != gateway.Port() {
+		return false
+	}
+	return gateway.Here(u.Hostname())
+}
+
+// hubPathOf is the hub itself or the hub for one agent (and a project),
+// not a longer name that only begins the same way.
+func hubPathOf(rawPath string) bool {
+	return hubPathUnder(rawPath, "")
+}
+
+// hubPathUnder is whether rawPath is the hub path beneath basePath (empty
+// for the gateway root, or a reverse-proxied MAGPIE_PUBLIC_URL prefix such
+// as /magpie).
+func hubPathUnder(rawPath, basePath string) bool {
+	if rawPath == "" {
+		return false
+	}
+	p := urlpath.Clean(rawPath)
+	if !strings.HasPrefix(p, "/") {
+		return false
+	}
+	if basePath != "" {
+		base := strings.TrimRight(urlpath.Clean(basePath), "/")
+		if base != "" && base != "." {
+			if !strings.HasPrefix(p, base+"/") {
+				return false
+			}
+			p = p[len(base):]
+		}
+	}
+	p = strings.TrimRight(p, "/")
+	return p == gateway.HubMCPAll || strings.HasPrefix(p, gateway.HubMCPPath)
+}
+
+// urlPort is u's port, or the scheme's default when it names none.
+func urlPort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
+// publicHub is whether u is this hub at MAGPIE_PUBLIC_URL (or
+// LAZYCAT_APP_DOMAIN), which may sit behind a reverse proxy on another
+// port (such as 443) or under a base path prefix.
+func publicHub(u *url.URL) bool {
+	raw := gateway.PublicURL()
+	if raw == "" {
+		return false
+	}
+	p, err := url.Parse(raw)
+	if err != nil || p.Host == "" || !strings.EqualFold(p.Hostname(), u.Hostname()) {
+		return false
+	}
+	if urlPort(p) != urlPort(u) {
+		return false
+	}
+	return hubPathUnder(u.Path, p.Path)
+}
+
+// routerLoop is whether s is the hub that is answering ctx. A dial of the
+// hub sends X-Magpie-Router (remoteHeaders); when that request is this
+// process, its Host is the URL's host, including a name ownHub doesn't
+// know and a Host with no port. A hub at another host or port is another
+// magpie's.
+func routerLoop(ctx context.Context, s *Server) bool {
+	if !gateway.FromRouter(ctx) || s == nil || !s.Remote() {
+		return false
+	}
+	return sameHub(s.URL, gateway.RouterHost(ctx))
+}
+
+// sameHub is whether raw is the hub at requestHost (as an HTTP request's
+// Host, with or without an explicit port). A Host with no port is the
+// scheme's default, 80 for http and 443 for https: a reverse proxy on 443
+// forwards Host: magpie.example.com, and Go's client omits that port. It
+// is not a match for an explicit other port, including :443 on http or
+// :80 on https. Loopback names of one port are the same machine. The
+// header carries no scheme, so a portless Host matches either default.
+func sameHub(raw, requestHost string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" || requestHost == "" {
+		return false
+	}
+	if !hubPathOf(u.Path) && !publicHub(u) {
+		return false
+	}
+	rh, rp, ok := splitRequestHost(requestHost)
+	if !ok {
+		return false
+	}
+	up := urlPort(u)
+	if rp != "" {
+		if up != rp {
+			return false
+		}
+	} else if !schemeDefault(u, up) {
+		return false
+	}
+	uh := u.Hostname()
+	if strings.EqualFold(uh, rh) {
+		return true
+	}
+	return gateway.Here(uh) && gateway.Here(rh)
+}
+
+// schemeDefault is whether port is the one a client omits for u's scheme.
+func schemeDefault(u *url.URL, port string) bool {
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return port == "80"
+	case "https":
+		return port == "443"
+	default:
+		return false
+	}
+}
+
+// splitRequestHost splits an HTTP Host header into host (without IPv6
+// brackets) and optional port.
+func splitRequestHost(requestHost string) (host, port string, ok bool) {
+	requestHost = strings.TrimSpace(requestHost)
+	if requestHost == "" {
+		return "", "", false
+	}
+	if h, p, err := net.SplitHostPort(requestHost); err == nil {
+		return h, p, h != ""
+	}
+	if strings.HasPrefix(requestHost, "[") && strings.HasSuffix(requestHost, "]") {
+		h := requestHost[1 : len(requestHost)-1]
+		return h, "", h != ""
+	}
+	if strings.Contains(requestHost, ":") {
+		if net.ParseIP(requestHost) != nil {
+			return requestHost, "", true
+		}
+		return "", "", false
+	}
+	return requestHost, "", true
 }
 
 // keepsSession is whether s is told which of the hub's callers a call is

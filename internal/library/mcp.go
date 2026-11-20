@@ -1873,7 +1873,8 @@ func foundServersOf(l *Library, targets []*Target) []Found {
 		}
 		mine := l.applied(t.Agent.ID).MCP
 		for name, s := range have {
-			if slices.Contains(mine, name) || l.server(name) != nil || !nameRe.MatchString(name) {
+			// this magpie's own hub, brought in, is listed inside itself (#7305)
+			if slices.Contains(mine, name) || l.server(name) != nil || !nameRe.MatchString(name) || ownHub(s) {
 				continue
 			}
 			f := byName[name]

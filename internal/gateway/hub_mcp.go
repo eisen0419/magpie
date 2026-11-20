@@ -250,9 +250,26 @@ func WithRouter(ctx context.Context) context.Context {
 	return context.WithValue(ctx, fromRouterKey{}, true)
 }
 
+type routerHostKey struct{}
+
+// WithRouterHost is ctx a request of another magpie's router that arrived
+// on host, the request's Host. FromRouter is set. The library leaves out a
+// server whose URL is that host's hub (routerLoop): a name for this
+// computer that isn't loopback still comes back here.
+func WithRouterHost(ctx context.Context, host string) context.Context {
+	return context.WithValue(WithRouter(ctx), routerHostKey{}, host)
+}
+
+// RouterHost is the Host of the router request ctx carries, or "".
+func RouterHost(ctx context.Context) string {
+	h, _ := ctx.Value(routerHostKey{}).(string)
+	return h
+}
+
 // FromRouter is whether ctx is a request of another magpie's router: the
 // servers behind this one that are a Remote magpie's router (HubServer's
-// Bridge) aren't listed or run for it.
+// Bridge) aren't listed or run for it, nor is one whose URL is the hub
+// the request came in on.
 func FromRouter(ctx context.Context) bool {
 	on, _ := ctx.Value(fromRouterKey{}).(bool)
 	return on
@@ -309,7 +326,7 @@ const errHubOff = "magpie's MCP hub is off, so it runs no server's tools: turn i
 func (s *Server) hubMCP(w http.ResponseWriter, r *http.Request) {
 	agent := r.PathValue("agent")
 	if r.Header.Get(RouterHeader) != "" {
-		r = r.WithContext(WithRouter(r.Context()))
+		r = r.WithContext(WithRouterHost(r.Context(), r.Host))
 	}
 	r = r.WithContext(WithHubVisitor(r.Context(), hubVisitor(r)))
 	serveMCP(w, r, "magpie's MCP hub", "magpie", hubBody, func(r *http.Request, m mcpMessage) (any, map[string]any) {
