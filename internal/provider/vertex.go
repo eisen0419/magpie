@@ -325,6 +325,14 @@ func VertexWholePath(model string) string {
 	return "/publishers/google/models/" + GeminiModelPath(model) + ":generateContent"
 }
 
+// VertexPredictPath is where an Imagen model is asked, answered as one
+// JSON body: publishers/google/models/<model>:predict. GeminiModelPath
+// drops a leading models/; a leading google/ is the caller's to drop, as
+// for VertexWholePath.
+func VertexPredictPath(model string) string {
+	return "/publishers/google/models/" + GeminiModelPath(model) + ":predict"
+}
+
 // vertexTest is the smallest request for model at a Vertex AI provider:
 // answered whole, after as little thinking as the model takes (Gemini 3
 // and later low, which each of them takes — Gemini 4 Argon's least of

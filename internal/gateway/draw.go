@@ -34,7 +34,8 @@ import (
 // qwen-image…) is asked there. OpenRouter uses its /images endpoint for
 // those models; its chat image models (gemini-*-image, gpt-5-image) stay on
 // chat completions with modalities. Gemini at Google is asked on its own
-// generateContent. A request that names no model draws with the Settings'
+// generateContent. Imagen on a Vertex AI project is asked on :predict
+// there. A request that names no model draws with the Settings'
 // image generation model, or one magpie picks (AutoDrawer).
 
 // DrawAgent is the User-Agent magpie's generate_image tool adds to its own.
@@ -1198,13 +1199,14 @@ func readPart(fh *multipart.FileHeader) (picture, error) {
 type drawVia int
 
 const (
-	viaImages drawVia = iota // /images/generations, /images/edits
-	viaChat                  // chat completions with modalities
-	viaGemini                // Google's own generateContent
+	viaImages  drawVia = iota // /images/generations, /images/edits
+	viaChat                   // chat completions with modalities
+	viaGemini                 // Google's own generateContent
+	viaPredict                // Imagen on Vertex AI's :predict
 )
 
 func (v drawVia) String() string {
-	return [...]string{"images API", "chat completions", "generateContent"}[v]
+	return [...]string{"images API", "chat completions", "generateContent", "predict"}[v]
 }
 
 func isGoogle(p provider.Provider) bool {
@@ -1240,6 +1242,32 @@ func vertexDrawsGemini(p provider.Provider, model string) bool {
 	return ok
 }
 
+// vertexImagenDrawer is model as Vertex AI's :predict names it, when p is
+// a Vertex AI project and model is an Imagen (imagen-4.0-generate-001):
+// with no google/ or models/ before it. Such a model draws at
+// …/publishers/google/models/<model>:predict, signed as its chat is,
+// never on the OpenAI-compatible images API under endpoints/openapi,
+// which Vertex doesn't serve Imagen on (#7365). Express mode serves
+// Gemini alone, so it has none. A partner model (publisher/model) and
+// Claude are not Imagen; "" and false for every provider but a project.
+func vertexImagenDrawer(p provider.Provider, model string) (string, bool) {
+	if !p.IsVertex() || p.VertexExpress() {
+		return "", false
+	}
+	bare := strings.TrimPrefix(strings.TrimPrefix(model, "google/"), "models/")
+	if bare == "" || provider.VertexPartner(bare) || provider.VertexClaude(bare) || !strings.Contains(strings.ToLower(bare), "imagen") {
+		return "", false
+	}
+	return bare, true
+}
+
+// vertexDrawsImagen is whether model draws on Vertex AI's :predict at p
+// (vertexImagenDrawer).
+func vertexDrawsImagen(p provider.Provider, model string) bool {
+	_, ok := vertexImagenDrawer(p, model)
+	return ok
+}
+
 func isOpenRouter(p provider.Provider) bool {
 	return provider.HostOf(p.Base(provider.Chat)) == "openrouter.ai"
 }
@@ -1258,6 +1286,8 @@ func viaFor(p provider.Provider, model string) drawVia {
 		return viaGemini
 	case vertexDrawsGemini(p, model):
 		return viaGemini
+	case vertexDrawsImagen(p, model):
+		return viaPredict
 	case p.ModelKind(model) == provider.KindImage:
 		// one the user said is an image model is asked at the images API
 		// first, as the editor's Makes: Image model says (a relay's
@@ -1511,7 +1541,7 @@ func (s *Server) drawAsked(ctx context.Context, p provider.Provider, model strin
 	}
 	via := viaFor(p, model)
 	out, code, err := s.drawOn(ctx, p, model, d, via)
-	if err != nil && via != viaGemini && (((code == 404 || code == 405) && !(isOpenRouter(p) && via == viaImages)) || pointsAway(via, code, err)) {
+	if err != nil && via != viaGemini && via != viaPredict && (((code == 404 || code == 405) && !(isOpenRouter(p) && via == viaImages)) || pointsAway(via, code, err)) {
 		other := viaChat
 		if via == viaChat {
 			other = viaImages
@@ -1544,6 +1574,12 @@ func (s *Server) drawOn(ctx context.Context, p provider.Provider, model string, 
 	switch via {
 	case viaGemini:
 		return s.drawGemini(ctx, p, model, d)
+	case viaPredict:
+		bare, ok := vertexImagenDrawer(p, model)
+		if !ok {
+			return drawn{}, 400, fmt.Errorf("%s can't draw with %s", p.Name, model)
+		}
+		return s.drawVertexImagen(ctx, p, bare, d)
 	case viaChat:
 		return s.drawChat(ctx, p, model, d)
 	}
@@ -2306,6 +2342,102 @@ func (s *Server) drawGemini(ctx context.Context, p provider.Provider, model stri
 		out.Text = strings.TrimSpace(out.Text)
 		return out, code, nil
 	})
+}
+
+// imagenAspects are the aspect ratios Imagen on Vertex AI takes
+// (imagen-4.0-generate-001 and the rest of that family).
+var imagenAspects = []string{"1:1", "3:4", "4:3", "9:16", "16:9"}
+
+// imagenSampleSize is the sampleImageSize an Imagen 4 model that takes
+// one is asked: "1K" or "2K". imagen-4.0-generate-001 and
+// imagen-4.0-ultra-generate-001 take those; the fast model and older
+// Imagen models don't, and are asked nothing. 4K isn't a value the API
+// takes, so a 4K ask goes as 2K, the largest they draw. "" asks the
+// model's own 1K.
+func imagenSampleSize(model string, d drawing) string {
+	switch strings.ToLower(model) {
+	case "imagen-4.0-generate-001", "imagen-4.0-ultra-generate-001":
+	default:
+		return ""
+	}
+	t := d.Tier
+	if t == "" {
+		t = imageSizeOf(d.shape())
+	}
+	switch t {
+	case "1K":
+		return "1K"
+	case "2K", "4K":
+		return "2K"
+	}
+	return ""
+}
+
+// drawVertexImagen asks an Imagen model on a Vertex AI project at
+// :predict, the only place Vertex serves it (#7365). The body is the one
+// Vertex documents: instances of a prompt, and parameters sampleCount,
+// aspectRatio and, for the models that take it, sampleImageSize. AI
+// Studio's own :predict is that same instances and predictions shape,
+// without sampleImageSize; magpie still asks AI Studio on its images
+// API. Pictures come back as predictions[].bytesBase64Encoded. Signed
+// with the Google token, as the project's chat is. An edit isn't asked:
+// Imagen 4 doesn't take one.
+func (s *Server) drawVertexImagen(ctx context.Context, p provider.Provider, model string, d drawing) (drawn, int, error) {
+	if len(d.Images) > 0 || d.Mask != nil || d.Markup != nil {
+		return drawn{}, http.StatusBadRequest, errors.New("Vertex AI's Imagen draws from a prompt on :predict and doesn't take an image to edit: describe the change in the prompt, or draw with a Gemini image model")
+	}
+	params := map[string]any{"sampleCount": d.N}
+	if r := aspectAmong(d.shape(), imagenAspects); r != "" {
+		if !slices.Contains(imagenAspects, r) {
+			return drawn{}, http.StatusBadRequest, fmt.Errorf("Vertex AI's Imagen takes an aspect ratio of %s, not %q: give one of those, or WIDTHxHEIGHT", strings.Join(imagenAspects, ", "), r)
+		}
+		params["aspectRatio"] = r
+	}
+	if sz := imagenSampleSize(model, d); sz != "" {
+		params["sampleImageSize"] = sz
+	}
+	body, _ := json.Marshal(map[string]any{
+		"instances":  []map[string]any{{"prompt": d.Prompt}},
+		"parameters": params,
+	})
+	url := p.Base(provider.Gemini) + provider.VertexPredictPath(model)
+	b, code, err := s.send(ctx, p, url, "application/json", body, true)
+	if err != nil {
+		return drawn{}, code, err
+	}
+	var res struct {
+		Predictions []struct {
+			Bytes    string `json:"bytesBase64Encoded"`
+			Mime     string `json:"mimeType"`
+			Prompt   string `json:"prompt"`
+			Filtered string `json:"raiFilteredReason"`
+		} `json:"predictions"`
+	}
+	if err := json.Unmarshal(b, &res); err != nil {
+		return drawn{}, 502, fmt.Errorf("%s's answer isn't Imagen's: %v", p.Name, err)
+	}
+	var out drawn
+	var why string
+	for _, pred := range res.Predictions {
+		if pred.Prompt != "" && out.Revised == "" {
+			out.Revised = pred.Prompt
+		}
+		if pred.Filtered != "" && why == "" {
+			why = pred.Filtered
+		}
+		if pred.Bytes == "" {
+			continue
+		}
+		data, err := base64.StdEncoding.DecodeString(pred.Bytes)
+		if err != nil {
+			return out, 502, fmt.Errorf("%s's image isn't base64: %v", p.Name, err)
+		}
+		out.Images = append(out.Images, picture{Mime: cmp.Or(pred.Mime, "image/png"), Data: data})
+	}
+	if len(out.Images) == 0 && why != "" {
+		return out, http.StatusBadGateway, fmt.Errorf("%s: %s", p.Name, why)
+	}
+	return out, code, nil
 }
 
 // pluginDrawsGemini is whether model is one p, a plugin, speaks Gemini's

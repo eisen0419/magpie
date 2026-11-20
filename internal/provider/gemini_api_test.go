@@ -18,10 +18,10 @@ func TestGeminiBase(t *testing.T) {
 		"https://generativelanguage.googleapis.com/":                                                           "https://generativelanguage.googleapis.com/v1beta",
 		"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse": "https://generativelanguage.googleapis.com/v1beta",
 		"https://relay.example/proxy/v1beta/models":                                                            "https://relay.example/proxy/v1beta",
-		"https://relay.example":          "https://relay.example",
-		"https://relay.example/":         "https://relay.example",
-		"relay.example:8080":             "https://relay.example:8080",
-		"https://relay.example/proxy/v1": "https://relay.example/proxy/v1",
+		"https://relay.example":                                                                                "https://relay.example",
+		"https://relay.example/":                                                                               "https://relay.example",
+		"relay.example:8080":                                                                                   "https://relay.example:8080",
+		"https://relay.example/proxy/v1":                                                                       "https://relay.example/proxy/v1",
 	} {
 		if got := GeminiBase(in); got != want {
 			t.Errorf("GeminiBase(%q) = %q, want %q", in, got, want)
@@ -65,12 +65,14 @@ func TestGeminiModelPathKeepsSlashes(t *testing.T) {
 		}
 	}
 	for got, want := range map[string]string{
-		GeminiPath("example/model-demo", true):         "/models/example/model-demo:streamGenerateContent?alt=sse",
-		GeminiPath("models/example/model-demo", false): "/models/example/model-demo:generateContent",
-		GeminiPath("gemini-2.5-pro", true):             "/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
-		VertexPath("example/model-demo"):               "/publishers/google/models/example/model-demo:streamGenerateContent?alt=sse",
-		VertexWholePath("example/model-demo"):          "/publishers/google/models/example/model-demo:generateContent",
-		VertexWholePath("gemini-2.5-pro"):              "/publishers/google/models/gemini-2.5-pro:generateContent",
+		GeminiPath("example/model-demo", true):              "/models/example/model-demo:streamGenerateContent?alt=sse",
+		GeminiPath("models/example/model-demo", false):      "/models/example/model-demo:generateContent",
+		GeminiPath("gemini-2.5-pro", true):                  "/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+		VertexPath("example/model-demo"):                    "/publishers/google/models/example/model-demo:streamGenerateContent?alt=sse",
+		VertexWholePath("example/model-demo"):               "/publishers/google/models/example/model-demo:generateContent",
+		VertexWholePath("gemini-2.5-pro"):                   "/publishers/google/models/gemini-2.5-pro:generateContent",
+		VertexPredictPath("imagen-4.0-generate-001"):        "/publishers/google/models/imagen-4.0-generate-001:predict",
+		VertexPredictPath("models/imagen-4.0-generate-001"): "/publishers/google/models/imagen-4.0-generate-001:predict",
 	} {
 		if got != want {
 			t.Errorf("path %q, want %q", got, want)

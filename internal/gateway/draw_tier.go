@@ -10,6 +10,9 @@ package gateway
 //
 //   - Gemini's generateContent: imageConfig.imageSize "1K", "2K" or "4K"
 //     (the Gemini 3 image models; a 2.x or Lite one draws at 1K alone);
+//   - Vertex AI's Imagen :predict: parameters.sampleImageSize "1K" or "2K"
+//     (imagen-4.0-generate-001 and imagen-4.0-ultra-generate-001; a 4K
+//     ask goes as 2K, the largest those models take);
 //   - chat completions (OpenRouter, a relay's Gemini): image_config's
 //     image_size beside its aspect_ratio, for a Gemini image model;
 //   - OpenRouter's Image API: resolution;
