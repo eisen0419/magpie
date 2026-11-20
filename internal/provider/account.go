@@ -171,8 +171,12 @@ func (p Provider) ListedAPIs(model string) []Protocol {
 	}
 	// Vertex AI serves Gemini on generateContent, its partner models
 	// (publisher/model) on chat completions alone, and Claude on
-	// Anthropic's Messages API alone
+	// Anthropic's Messages API alone. A Gemini image model a relay names
+	// google/gemini-… is still generateContent (VertexGeminiImage).
 	if p.IsVertex() {
+		if _, ok := VertexGeminiImage(model); ok {
+			return []Protocol{Gemini}
+		}
 		if VertexPartner(model) {
 			return []Protocol{Chat}
 		}

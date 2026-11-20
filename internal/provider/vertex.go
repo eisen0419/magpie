@@ -56,6 +56,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/lazyre"
 )
 
@@ -234,9 +235,22 @@ func (p Provider) VertexExpress() bool {
 
 // VertexPath is where, after a Vertex AI provider's base, a request for
 // model goes: streamed, as the gateway asks every one there but a Gemini
-// client's own asked whole (VertexWholePath).
+// client's own asked whole (VertexWholePath). A Gemini image model is
+// named by its bare id (vertexAskedModel).
 func VertexPath(model string) string {
-	return "/publishers/google/models/" + GeminiModelPath(model) + ":streamGenerateContent?alt=sse"
+	return "/publishers/google/models/" + GeminiModelPath(vertexAskedModel(model)) + ":streamGenerateContent?alt=sse"
+}
+
+// vertexAskedModel is the id a publishers/google/models path names. A
+// Gemini image model is its bare id, so a relay's google/ or
+// google/models/ is not a second publisher segment. A partner id, a
+// Gemini that only chats (google/gemini-3.8-flash) and an Imagen are
+// named as given.
+func vertexAskedModel(model string) string {
+	if bare, ok := VertexGeminiImage(model); ok {
+		return bare
+	}
+	return model
 }
 
 // VertexPartner is whether model is one of Vertex AI's partner or open
@@ -244,9 +258,35 @@ func VertexPath(model string) string {
 // which Google serves on its OpenAI-compatible chat completions at the
 // project (Base(Chat), …/endpoints/openapi) under a publisher/model id
 // such as deepseek-ai/deepseek-v4.1-flash-maas. Every such id models.dev
-// lists for google-vertex has the publisher before a slash, and no Gemini
-// id on generateContent has one, so the slash is what tells them apart.
+// lists for google-vertex has the publisher before a slash. A Gemini
+// image model a relay names google/gemini-… has a slash too. That one is
+// VertexGeminiImage: VertexPath names its bare id, and a caller that
+// means a partner, or that fits Gemini's levels, uses the bare id.
+// This still reports the slash, so google/gemini-3.8-flash (chat only),
+// deepseek-ai/…, qwen/…, anthropic/… and google/imagen-… stay partners.
 func VertexPartner(model string) bool { return strings.Contains(model, "/") }
+
+// VertexGeminiImage is whether model draws on Vertex AI's generateContent
+// as a Gemini image model (gemini-3.1-flash-image, gemini-nano-banana-2.1,
+// gemini-2.5-flash-image), and the id that path names. A relay's google/
+// and a leading models/ are taken off: google/gemini-3.1-flash-image is
+// that model, not a partner publisher. An Imagen, which draws on :predict,
+// a partner model and a Gemini that only chats (google/gemini-3.8-flash,
+// google/gemma-…) are not one.
+func VertexGeminiImage(model string) (bare string, ok bool) {
+	m := strings.TrimSpace(model)
+	m = strings.TrimPrefix(m, "google/")
+	m = strings.TrimPrefix(m, "models/")
+	if m == "" || strings.Contains(m, "/") || catalog.ImagesAPI(m) {
+		return "", false
+	}
+	low := strings.ToLower(m)
+	banana := strings.Contains(low, "banana")
+	if strings.HasPrefix(low, "gemini-") && (strings.Contains(low, "image") || banana) || banana {
+		return m, true
+	}
+	return "", false
+}
 
 // VertexClaude is whether model is one of Anthropic's Claude models on
 // Vertex AI (claude-opus-5-5, claude-sonnet-4-5@20250929), which Google
@@ -320,9 +360,10 @@ func marshalRaw(m map[string]json.RawMessage) ([]byte, error) {
 }
 
 // VertexWholePath is where a request for model answered as one JSON body
-// goes.
+// goes. A Gemini image model is named by its bare id, as VertexPath names
+// one it streams.
 func VertexWholePath(model string) string {
-	return "/publishers/google/models/" + GeminiModelPath(model) + ":generateContent"
+	return "/publishers/google/models/" + GeminiModelPath(vertexAskedModel(model)) + ":generateContent"
 }
 
 // vertexTest is the smallest request for model at a Vertex AI provider:
@@ -332,6 +373,9 @@ func VertexWholePath(model string) string {
 // untold it thinks at medium, past the 16 tokens; 2.5 Pro 128 tokens,
 // which it can't go under; 2.5's Flash none).
 func vertexTest(q Provider, model string) (string, string) {
+	// the thinking below is about the id the path names, which for a
+	// Gemini image model is its bare id (VertexWholePath)
+	model = vertexAskedModel(model)
 	think := `"thinkingConfig":{"thinkingLevel":"low"},`
 	switch m := strings.ToLower(model); {
 	case strings.HasPrefix(m, "gemini-2.5-pro"):
@@ -341,7 +385,7 @@ func vertexTest(q Provider, model string) (string, string) {
 	case vertexGeneration(m) < 3:
 		think = ""
 	}
-	return q.Base(Gemini) + "/publishers/google/models/" + GeminiModelPath(model) + ":generateContent",
+	return q.Base(Gemini) + VertexWholePath(model),
 		`{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{` + think + `"maxOutputTokens":16}}`
 }
 

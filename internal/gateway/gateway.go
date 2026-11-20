@@ -8470,11 +8470,23 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 	}
 	// Gemini's signatures another provider gave go to none (ownSignatures)
 	req = ownSignatures(req, p.ID)
-	if p.IsVertex() && !provider.VertexPartner(model) && !provider.VertexClaude(model) {
+	// a relay's google/gemini-… image model is that Gemini, asked on
+	// generateContent. Its bare id is what the level and the budget are
+	// about: the slash would read as a partner (VertexPartner) and the
+	// effort would go out as the client named it.
+	vxModel := model
+	if bare, ok := provider.VertexGeminiImage(model); ok {
+		vxModel = bare
+	}
+	if p.IsVertex() && !provider.VertexPartner(vxModel) && !provider.VertexClaude(vxModel) {
 		// Gemini's levels; a partner model on chat completions, and
 		// Claude on Anthropic's Messages API, are sent their effort as
 		// at any vendor of that API
-		req = vertexEffort(req, p.Efforts(model))
+		levels := p.Efforts(model)
+		if len(levels) == 0 && vxModel != model {
+			levels = p.Efforts(vxModel)
+		}
+		req = vertexEffort(req, levels)
 	}
 	// the names in force, read once however many endpoints the request is
 	// built for below

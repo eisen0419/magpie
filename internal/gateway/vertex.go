@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"slices"
 	"strings"
+
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // ---- Google Vertex AI (provider side) ----------------------------------------
@@ -34,8 +36,12 @@ import (
 // Vertex (bedrockBetas).
 
 // buildVertex is a streamGenerateContent body for Vertex AI, which names the
-// model in its path and has none in here.
+// model in its path and has none in here. A Gemini image model is asked as
+// its bare id, the one that path names.
 func buildVertex(r *Request, model string) ([]byte, error) {
+	if bare, ok := provider.VertexGeminiImage(model); ok {
+		model = bare
+	}
 	req, err := geminiRequest(r, model, "vertex")
 	if err != nil {
 		return nil, err
@@ -54,6 +60,11 @@ func buildVertex(r *Request, model string) ([]byte, error) {
 // enabled"), and Pro, which can't stop ("does not support setting
 // thinking_budget to 0"), its least. A Gemini before 2.5 doesn't think.
 func vertexThinking(r *Request, model string) map[string]any {
+	if bare, ok := provider.VertexGeminiImage(model); ok {
+		// 2.5's budget is decided from the bare id: a relay's google/
+		// would miss the gemini-2.5 prefix and be sent a level
+		model = bare
+	}
 	m := strings.ToLower(model)
 	if strings.HasPrefix(m, "gemini-1") || strings.HasPrefix(m, "gemini-2.0") {
 		return nil

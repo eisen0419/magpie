@@ -33,7 +33,10 @@ import (
 // qwen-image…) is asked there. OpenRouter uses its /images endpoint for
 // those models; its chat image models (gemini-*-image, gpt-5-image) stay on
 // chat completions with modalities. Gemini at Google is asked on its own
-// generateContent. A request that names no model draws with the Settings'
+// generateContent, and so is a Gemini image model on Vertex AI
+// (VertexGeminiImage): at the project's generateContent, signed as
+// Vertex's other calls, not on the chat completions a partner model uses.
+// A request that names no model draws with the Settings'
 // image generation model, or one magpie picks (AutoDrawer).
 
 // DrawAgent is the User-Agent magpie's generate_image tool adds to its own.
@@ -424,7 +427,9 @@ func DrawersOf(p provider.Provider, avail func() []catalog.Model) []catalog.Mode
 	// draws nothing magpie can ask for yet. A Responses-only relay (a Codex
 	// backend such as sub2api) has no chat base but serves the images API
 	// under the same root as its Responses endpoint, so it draws all the same.
-	if p.Account != nil || (p.Base(provider.Chat) == "" && p.Base(provider.Responses) == "") {
+	// Vertex AI's express mode has neither base and still lists a Gemini
+	// image model the user added: it draws on generateContent.
+	if p.Account != nil || (p.Base(provider.Chat) == "" && p.Base(provider.Responses) == "" && !vertexDraws(p)) {
 		return nil
 	}
 	out := p.PlanDrawers()
@@ -1199,12 +1204,24 @@ func isGoogle(p provider.Provider) bool {
 	return provider.HostOf(p.Base(provider.Chat)) == "generativelanguage.googleapis.com"
 }
 
+// vertexDraws is Vertex AI with an address to ask, express mode included.
+// Express mode's chat and Responses bases are empty; a Gemini image model
+// there is still drawn on generateContent.
+func vertexDraws(p provider.Provider) bool {
+	return p.IsVertex() && p.Base(provider.Gemini) != ""
+}
+
 func isOpenRouter(p provider.Provider) bool {
 	return provider.HostOf(p.Base(provider.Chat)) == "openrouter.ai"
 }
 
 // viaFor is where model is best asked to draw at p.
 func viaFor(p provider.Provider, model string) drawVia {
+	if _, ok := provider.VertexGeminiImage(model); p.IsVertex() && ok {
+		// a Gemini image model, including one a relay names google/gemini-…,
+		// draws on generateContent; a partner model and an Imagen do not
+		return viaGemini
+	}
 	switch {
 	case p.IsRemoteMagpie():
 		// another magpie's images API asks the model's vendor the way
@@ -1459,7 +1476,12 @@ func (s *Server) drawAsked(ctx context.Context, p provider.Provider, model strin
 		return s.drawCodeAssist(ctx, p, model, d)
 	}
 	if p.Base(provider.Chat) == "" && p.Base(provider.Responses) == "" {
-		return drawn{}, 400, fmt.Errorf("%s can't draw: magpie draws only through an OpenAI-compatible API, and %s has none", p.Name, p.Name)
+		// Vertex express mode has neither, and a Gemini image model still
+		// draws on generateContent at the Gemini base
+		_, geminiImage := provider.VertexGeminiImage(model)
+		if !(vertexDraws(p) && geminiImage) {
+			return drawn{}, 400, fmt.Errorf("%s can't draw: magpie draws only through an OpenAI-compatible API, and %s has none", p.Name, p.Name)
+		}
 	}
 	via := viaFor(p, model)
 	out, code, err := s.drawOn(ctx, p, model, d, via)
@@ -2186,8 +2208,23 @@ func (s *Server) drawChat(ctx context.Context, p provider.Provider, model string
 	})
 }
 
+// geminiDrawURL is where model is asked to draw, and whether the request
+// is signed. Vertex AI's is its Gemini base plus VertexWholePath, signed
+// so a project gets its Google token and express mode its API key.
+// VertexWholePath names a Gemini image model by its bare id, so a relay's
+// google/ is not part of the path. AI Studio's is generateContent under
+// the chat base, and send sets the key header when it doesn't sign.
+func geminiDrawURL(p provider.Provider, model string) (string, bool) {
+	if p.IsVertex() {
+		return strings.TrimRight(p.Base(provider.Gemini), "/") + provider.VertexWholePath(model), true
+	}
+	base := strings.TrimSuffix(strings.TrimRight(p.Base(provider.Chat), "/"), "/openai")
+	return base + "/models/" + provider.GeminiModelPath(model) + ":generateContent", false
+}
+
 // drawGemini asks Gemini at Google on its own API, which answers with
-// images where its OpenAI-compatible one doesn't.
+// images where its OpenAI-compatible one doesn't. On Vertex AI the same
+// body goes to the project's generateContent (geminiDrawURL).
 func (s *Server) drawGemini(ctx context.Context, p provider.Provider, model string, d drawing) (drawn, int, error) {
 	parts := []map[string]any{{"text": drawPrompt(d)}}
 	for _, pic := range d.Images {
@@ -2205,10 +2242,9 @@ func (s *Server) drawGemini(ctx context.Context, p provider.Provider, model stri
 		cfg["imageConfig"] = c
 	}
 	body, _ := json.Marshal(map[string]any{"contents": []map[string]any{{"role": "user", "parts": parts}}, "generationConfig": cfg})
-	base := strings.TrimSuffix(strings.TrimRight(p.Base(provider.Chat), "/"), "/openai")
-	url := base + "/models/" + provider.GeminiModelPath(model) + ":generateContent"
+	url, sign := geminiDrawURL(p, model)
 	return s.eachDrawing(d.N, func() (drawn, int, error) {
-		b, code, err := s.send(ctx, p, url, "application/json", body, false)
+		b, code, err := s.send(ctx, p, url, "application/json", body, sign)
 		if err != nil {
 			return drawn{}, code, err
 		}
