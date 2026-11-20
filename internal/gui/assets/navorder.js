@@ -26,6 +26,13 @@ window.navArrange = function () {
     while (nx?.matches(".nav-sub, .thumb")) nx = nx.nextElementSibling;
     if (nx !== e) nav.insertBefore(e, nx);
     prev = e;
+    // a plugin page in this built-in's place stays with it when the order
+    // is put on after that tab exists (#7335)
+    const repl = e.dataset?.replaced;
+    if (repl) {
+      const b = nav.querySelector(`button[data-plugin-page][data-view="${repl}"]`);
+      if (b) { if (e.nextElementSibling !== b) e.after(b); prev = b; }
+    }
   }
   for (const e of home) if (!e.dataset.view) own ? e.remove() : e.dataset.en && (e.textContent = t(e.dataset.en));
 };

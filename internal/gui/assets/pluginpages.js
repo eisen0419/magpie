@@ -243,6 +243,9 @@
   }
 
   async function load() {
+    // read before start.js's show() of a fallback page replaces it
+    let kept = "";
+    try { kept = localStorage.getItem("magpie.lastView") || ""; } catch { /* none kept */ }
     loadPanels();
     let list;
     try { list = await api("plugin-pages"); } catch { return; }
@@ -306,17 +309,10 @@
       at.after(b);
       at = b;
     }
-    navSubs();
-    // a reload of a plugin's page, or the one the window was left on,
-    // comes back to it once its tab is there
-    if (view === "agents" && !opened) {
-      opened = true;
-      let want = params.get("view") || "";
-      if (!want) { try { want = localStorage.getItem("magpie.lastView") || ""; } catch { /* none kept */ } }
-      if (pages.has(want)) show(want);
-    }
+    // hides, the reader's order and a kept plugin page, once the tabs
+    // exist; the window's first navHides ran before they did (#7335)
+    import("./pluginnav.js").then((m) => m.afterPages(pages, kept), () => navSubs());
   }
-  let opened = false;
 
   // ---- actions ----
 

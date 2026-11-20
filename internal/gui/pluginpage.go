@@ -127,12 +127,75 @@ type pluginPanel struct {
 // pageKeyChars are what a window page's key can't have
 var pageKeyChars = strings.NewReplacer("@", "", "/", "-", ".", "-", "_", "-", " ", "-")
 
+// pageBaseKey is the window key a plugin has when it is the only one of
+// its short name: plugin- plus that name, with what a page key can't hold
+// taken out. A sidebar hide (magpie.navHidden) stores this key, so a
+// plugin installed once must keep it.
+func pageBaseKey(pkg string) string {
+	key := "plugin-" + strings.Trim(pageKeyChars.Replace(strings.ToLower(plugin.ShortName(pkg))), "-")
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+			return r
+		}
+		return -1
+	}, key)
+}
+
+// pageKeys are the window keys for specs, in that order. Two on plugins
+// whose short names land on one key used to take -2, -3 in plugins.json's
+// order, so an update that reordered the file renamed the page and a hide
+// stored under the old key no longer matched (#7335). A plugin that is the
+// only one of its key keeps that key. The ones that share a key take it,
+// then -2, -3, in spec order, skipping a key another plugin keeps.
+func pageKeys(specs, bases []string) []string {
+	count := map[string]int{}
+	for _, b := range bases {
+		count[b]++
+	}
+	keys := make([]string, len(bases))
+	seen := map[string]bool{}
+	take := func(i int, base string) {
+		key := base
+		for k, n := key, 2; seen[key]; n++ {
+			key = fmt.Sprintf("%s-%d", k, n)
+		}
+		seen[key] = true
+		keys[i] = key
+	}
+	for i, b := range bases {
+		if count[b] == 1 {
+			take(i, b)
+		}
+	}
+	var dup []int
+	for i, b := range bases {
+		if count[b] > 1 {
+			dup = append(dup, i)
+		}
+	}
+	slices.SortStableFunc(dup, func(i, j int) int {
+		if c := cmp.Compare(bases[i], bases[j]); c != 0 {
+			return c
+		}
+		return cmp.Compare(specs[i], specs[j])
+	})
+	for _, i := range dup {
+		take(i, bases[i])
+	}
+	return keys
+}
+
 // windowParts are the pages and the panels of the plugins that are on, in
 // plugins.json's order. A plugin switched off has none: its files aren't
-// served.
+// served. Page keys do not follow that order: see pageKeys.
 func windowParts() (pages []pluginPage, panels []pluginPanel) {
-	seen := map[string]bool{}
-	replaced := map[string]bool{}
+	type item struct {
+		e    plugin.Entry
+		w    *plugin.WindowSpec
+		only bool
+		name string
+	}
+	var items []item
 	for _, e := range plugin.Load().Plugins {
 		if e.Off {
 			continue
@@ -141,18 +204,19 @@ func windowParts() (pages []pluginPage, panels []pluginPanel) {
 		if w == nil {
 			continue
 		}
-		name := plugin.PackageName(e.Spec)
-		key := "plugin-" + strings.Trim(pageKeyChars.Replace(strings.ToLower(plugin.ShortName(name))), "-")
-		key = strings.Map(func(r rune) rune {
-			if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
-				return r
-			}
-			return -1
-		}, key)
-		for k, n := key, 2; seen[key]; n++ {
-			key = fmt.Sprintf("%s-%d", k, n)
-		}
-		seen[key] = true
+		items = append(items, item{e, w, only, plugin.PackageName(e.Spec)})
+	}
+	specs := make([]string, len(items))
+	bases := make([]string, len(items))
+	for i, it := range items {
+		specs[i] = it.e.Spec
+		bases[i] = pageBaseKey(it.name)
+	}
+	keys := pageKeys(specs, bases)
+	replaced := map[string]bool{}
+	for i, it := range items {
+		e, w, only, name := it.e, it.w, it.only, it.name
+		key := keys[i]
 		reads := w.Reads
 		if reads == nil {
 			reads = []string{}
