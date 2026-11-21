@@ -68,6 +68,9 @@ func wireEffort(to provider.Protocol, req *Request) (string, bool) {
 		if req.ThinkOff {
 			return "none", true
 		}
+		if req.SyntheticThinking && forcesTool(req.ToolChoice) {
+			return "", true
+		}
 		return req.Effort, true
 	case to == provider.Chat || to == provider.Responses:
 		return req.Effort, true

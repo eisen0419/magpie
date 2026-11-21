@@ -353,6 +353,29 @@ type Request struct {
 	// is asked at low, or without it, as it would have been
 	// (ownEffortRefused)
 	OwnEffort bool
+	// EffortOverride is set when Effort was stamped by a routing rule, a
+	// fixed member, an effort map or WithSideEffort, and this body is the
+	// translated form of that ask: the exact level, at the client's
+	// max_tokens. Building it again raises max_tokens via replyRoom so the
+	// budget is not dropped or cut down, and a model asked in
+	// output_config.effort keeps that field. A client's own effort is not this.
+	EffortOverride bool
+	// SyntheticThinking is set when EffortOverride stamped thinking onto an
+	// Anthropic client body that did not ask to think. anthropicBody skips
+	// emitting synthetic thinking alongside a forced tool_choice (while
+	// Chat/Responses still receive reasoning_effort, #7389).
+	SyntheticThinking bool
+	// SideReplyRoom is set when WithSideEffort originated an Anthropic
+	// override entering translate: adaptive Claudes keep replyRoom above
+	// the caller's max_tokens (bounded by OutputCap), matching native (#7389).
+	SideReplyRoom bool
+	// WireModel is the upstream id when the model magpie knows is a local
+	// alias. anthropicBody uses it for adaptive, budget and output_config
+	// decisions; the model field is still rewritten to it afterwards (#7389).
+	WireModel string
+	// OutputCap is the Max output or context-window reply cap a raised
+	// max_tokens may not pass, 0 when none (attemptMaxOut).
+	OutputCap int
 	// CacheKey is the client's prompt_cache_key (Codex sends its thread's
 	// id), which OpenAI, and relays in front of it, route a conversation by
 	// to where its prompt is cached.

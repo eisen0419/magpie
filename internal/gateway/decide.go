@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -673,8 +674,8 @@ func withEffort(proto provider.Protocol, body []byte, effort string) []byte {
 		Thinking *struct {
 			Type string `json:"type"`
 		} `json:"thinking"`
-		OutputConfig map[string]any `json:"output_config"`
-		MaxTokens    int            `json:"max_tokens"`
+		OutputConfig map[string]json.RawMessage `json:"output_config"`
+		MaxTokens    int                        `json:"max_tokens"`
 	}
 	if effort == "" || decodeJSON(body, &v) != nil {
 		return body
@@ -699,13 +700,17 @@ func withEffort(proto provider.Protocol, body []byte, effort string) []byte {
 		if v.Thinking == nil {
 			return body
 		}
+		rawEffort, err := json.Marshal(effort)
+		if err != nil {
+			return body
+		}
 		switch v.Thinking.Type {
 		case "adaptive":
 			oc := v.OutputConfig
 			if oc == nil {
-				oc = map[string]any{}
+				oc = map[string]json.RawMessage{}
 			}
-			oc["effort"] = effort
+			oc["effort"] = rawEffort
 			return withFields(body, map[string]any{"output_config": oc})
 		case "enabled":
 			// the budget must leave room for the answer
@@ -717,9 +722,11 @@ func withEffort(proto provider.Protocol, body []byte, effort string) []byte {
 				return body
 			}
 			fields := map[string]any{"thinking": map[string]any{"type": "enabled", "budget_tokens": budget}}
-			if oc := v.OutputConfig; oc != nil && oc["effort"] != nil {
-				oc["effort"] = effort
-				fields["output_config"] = oc
+			if oc := v.OutputConfig; oc != nil {
+				if raw := bytes.TrimSpace(oc["effort"]); len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+					oc["effort"] = rawEffort
+					fields["output_config"] = oc
+				}
 			}
 			return withFields(body, fields)
 		}
@@ -847,15 +854,19 @@ func withFixedEffort(proto provider.Protocol, body []byte, effort string) []byte
 		return withFields(body, map[string]any{"reasoning_effort": effort})
 	case provider.Responses:
 		var v struct {
-			Reasoning map[string]any `json:"reasoning"`
+			Reasoning map[string]json.RawMessage `json:"reasoning"`
 		}
 		if decodeJSON(body, &v) != nil {
 			return body
 		}
 		if v.Reasoning == nil {
-			v.Reasoning = map[string]any{}
+			v.Reasoning = map[string]json.RawMessage{}
 		}
-		v.Reasoning["effort"] = effort
+		rawEffort, err := json.Marshal(effort)
+		if err != nil {
+			return body
+		}
+		v.Reasoning["effort"] = rawEffort
 		// and the agent's last change of effort mid-thread, which an
 		// upstream reading the items would take over the top's
 		return withEffortUpdated(withFields(body, map[string]any{"reasoning": v.Reasoning}), effort)
@@ -929,11 +940,691 @@ func agyLevelAsked(agent string, proto provider.Protocol, body []byte) bool {
 // withModelEffort is withFixedEffort for a request going to model: a
 // Gemini request's thinkingConfig is the one model takes (withGeminiEffortFor),
 // using efforts when the provider declares them before the static catalog.
+// An Anthropic request is asked in the shape model reads (#7389): model is
+// the upstream name (effortShapeModelAt), a level in output_config.effort
+// where that is what the model, or the translation off this body, takes as
+// the level, and a budget for a model that does not read that field — with
+// the room max_tokens needs so the budget is not read back as a lower level.
 func withModelEffort(proto provider.Protocol, body []byte, model, effort string, efforts []string) []byte {
+	return withModelEffortMode(proto, body, model, effort, efforts, false)
+}
+
+// withModelEffortMode is withModelEffort with translated telling whether an
+// Anthropic Messages body will be translated to another protocol rather than
+// sent on Anthropic's API. Translated requests carry the exact level in
+// output_config.effort with thinking enabled without touching max_tokens or
+// lossy budget_tokens buckets (#7389).
+func withModelEffortMode(proto provider.Protocol, body []byte, model, effort string, efforts []string, translated bool) []byte {
+	return withModelEffortAt(proto, body, "", model, effort, efforts, translated)
+}
+
+// withModelEffortAt is withModelEffortMode with host so provider-host effort
+// rules (such as DeepSeek's Anthropic endpoint in outputEffortAt) are honored
+// on native Messages bodies (#7389).
+func withModelEffortAt(proto provider.Protocol, body []byte, host, model, effort string, efforts []string, translated bool) []byte {
 	if proto == provider.Gemini && effort != "" {
 		return withGeminiEffortFor(body, model, effort, efforts)
 	}
+	if proto == provider.Anthropic && effort != "" {
+		return withAnthropicFixedMode(body, host, model, effort, translated, false, true, false)
+	}
 	return withFixedEffort(proto, body, effort)
+}
+
+// anthropicAdaptive reports whether model takes adaptive thinking on an
+// Anthropic Messages body rather than a thinking budget: a Claude that thinks
+// only adaptively, or a Gemini 3+ relay model whose thinkingBudget
+// geminiLevelBody would discard (#7389).
+func anthropicAdaptive(model string) bool {
+	return adaptiveOnly(model) || geminiGeneration(strings.ToLower(model)) >= 3
+}
+
+// anthropicLevelInOutput is whether model at host is asked its level in
+// output_config.effort rather than by a thinking budget alone: a Claude
+// that thinks only adaptively, a vendor model or host that reads the field
+// (outputEffortAt: effortInOutputConfig or DeepSeek's host), or a Gemini 3
+// or later on a Messages body. A budget Claude, a custom relay id and a
+// budget-based vendor (kimi-k3, MiniMax-M3, GLM-5-Turbo, qwen) are not.
+// They are asked the budget, and a field they were not sent is not added;
+// one the client already named is rewritten. Translating this body still
+// carries the level in output_config.effort, which the translation reads
+// over the budget (#7389).
+func anthropicLevelInOutput(host, model string) bool {
+	return adaptiveOnly(model) || outputEffortAt(host, model) || geminiGeneration(strings.ToLower(model)) >= 3
+}
+
+// forcedAnthropicToolChoice reports a tool_choice that forces a call
+// (type "tool" or "any"). The key is read by decoding the JSON, so a
+// unicode escape (tool\u005fchoice) counts; a raw byte search misses it
+// and use-effort would enable thinking beside the force, which Anthropic
+// rejects (#7389).
+func forcedAnthropicToolChoice(body []byte) bool {
+	var v struct {
+		ToolChoice *struct {
+			Type string `json:"type"`
+		} `json:"tool_choice"`
+	}
+	return decodeJSON(body, &v) == nil && v.ToolChoice != nil && (v.ToolChoice.Type == "tool" || v.ToolChoice.Type == "any")
+}
+
+// effortShapeModelAt is the name that decides an Anthropic effort's wire
+// shape: the upstream name in wires when one is set, else model. wires is
+// the turn's snapshot (wiresOf) or, where a call has no request,
+// settings.Shared().Wires(). A local alias is not a Claude, and the
+// vendor's name is what the request is sent as (#7389). The snapshot is
+// the same map passthrough rewrites "model" from, so a settings.Save
+// while the turn is in flight cannot ask one shape and send another name.
+func effortShapeModelAt(wires map[string]string, p provider.Provider, model string) string {
+	if p.ID == "" || model == "" {
+		return model
+	}
+	if wire := provider.UpstreamNameAsIn(wires, p.ID, model, p.SentIDAt(model, "")); wire != "" {
+		return wire
+	}
+	return model
+}
+
+// withAnthropicFixed asks an Anthropic request for effort on model,
+// whatever it asked. "none" turns thinking off and drops an effort the
+// request carried, which would otherwise outrank the off. When translated
+// is true (the member speaks Chat, Responses, Gemini or the Claude
+// subscription bridge rather than Anthropic's HTTP API),
+// output_config.effort and adaptive thinking carry the exact level
+// (including max vs xhigh) into parseAnthropic without inflating
+// max_tokens. Otherwise a native request with a forced tool_choice
+// ("tool" or "any") and no thinking is left without thinking, so enabling
+// it cannot trigger a 400, but an output_config.effort the client already
+// sent is still rewritten to the level. A model asked in
+// output_config.effort gets that field, top-level and on any message that
+// already names one. A budget model gets a budget of the level, with
+// max_tokens raised when the client's cap would cut it into a lower level
+// (still bounded by the member's Max output and any context-window reply
+// cap). tight is that cap at or under the least budget: a request that
+// did not ask to think is not given a synthetic thinking the cap would
+// turn off, nor a synthetic output_config.effort beside it.
+func withAnthropicFixed(body []byte, model, effort string, translated bool) []byte {
+	return withAnthropicFixedMode(body, "", model, effort, translated, false, true, false)
+}
+
+// withAnthropicFixedMode is withAnthropicFixed with host, needEnabled,
+// stripSampling and tight. "none" and an unknown level are handled here,
+// once, for both entry points. needEnabled is an upstream that takes this
+// model only with thinking.type "enabled" (thinkingNeeded): an adaptive
+// Claude is asked a budget instead of adaptive thinking, which that
+// upstream refuses. stripSampling is false when the caller still runs
+// withMaxOutput, which may turn the thinking back off and must then keep
+// the sampling a thinking request would have dropped (#7389). tight is a
+// Max output or reply cap that cannot hold the least thinking budget.
+func withAnthropicFixedMode(body []byte, host, model, effort string, translated, needEnabled, stripSampling, tight bool) []byte {
+	if effort == "none" {
+		body = withFields(body, map[string]any{"thinking": map[string]any{"type": "disabled"}})
+		return editJSON(body, clearOutputEfforts)
+	}
+	level := effortOf(effort)
+	if level == "" {
+		return body
+	}
+	if translated {
+		return withAnthropicTranslated(body, level)
+	}
+	// no thinking beside a forced call, and no synthetic thinking under a
+	// cap that cannot hold a budget (withMaxOutput would write disabled,
+	// and thinkingOffAsTaken would then grow max_tokens). An effort the
+	// client already named is still rewritten. Adaptive thinking is not a
+	// budget, so a cap leaves it unless this upstream takes only enabled.
+	if !thinkingAsked(body) && (forcedAnthropicToolChoice(body) || (tight && (needEnabled || !anthropicAdaptive(model)))) {
+		return patchAnthropicEffort(body, anthropicPatch{level: level, kind: patchRewriteEffort})
+	}
+	if anthropicLevelInOutput(host, model) {
+		return withAnthropicLevel(body, model, level, needEnabled, stripSampling, tight)
+	}
+	return patchAnthropicEffort(body, anthropicPatch{level: level, kind: patchBudget, needEnabled: needEnabled, stripSampling: stripSampling, tight: tight})
+}
+
+// withoutThinkingSampling drops temperature, top_p and top_k when after
+// enabled thinking that before did not ask for. Anthropic rejects those
+// fields once thinking is on (#7389).
+func withoutThinkingSampling(before, after []byte) []byte {
+	if thinkingAsked(before) || !thinkingAsked(after) || !hasSampling(after) {
+		return after
+	}
+	return withoutFields(after, "temperature", "top_p", "top_k")
+}
+
+// anthropicPatch is one pass over an Anthropic body's top-level raw
+// values: output_config, thinking, max_tokens and, only when a message
+// already names one, that message's output_config.effort. messages and
+// tools stay raw unless a message carries output_config (#7389).
+type anthropicPatch struct {
+	level         string
+	kind          int
+	adaptive      bool
+	needEnabled   bool
+	stripSampling bool
+	tight         bool
+}
+
+const (
+	patchTranslated = iota
+	patchLevel
+	patchBudget
+	patchRewriteEffort
+)
+
+// withAnthropicTranslated writes level into output_config.effort (and any
+// message output_config.effort) and ensures thinking is on so
+// parseAnthropic reads the exact level for Chat/Responses/Gemini without
+// altering max_tokens.
+func withAnthropicTranslated(body []byte, level string) []byte {
+	return patchAnthropicEffort(body, anthropicPatch{level: level, kind: patchTranslated})
+}
+
+// withAnthropicLevel writes level into output_config.effort and asks model
+// to think. An adaptive Claude or Gemini 3+ relay model is asked adaptive
+// thinking with the level, not a budget max_tokens can cut and that a later
+// pass would discard or read back as another level, unless needEnabled: that
+// upstream refused every thinking type but "enabled", so the level's budget
+// is sent instead. Any other model is given thinking as well, so the level
+// is read (parseAnthropic uses it only when thinking is on).
+func withAnthropicLevel(body []byte, model, level string, needEnabled, stripSampling, tight bool) []byte {
+	return patchAnthropicEffort(body, anthropicPatch{
+		level: level, kind: patchLevel, adaptive: anthropicAdaptive(model),
+		needEnabled: needEnabled, stripSampling: stripSampling, tight: tight,
+	})
+}
+
+// withAnthropicBudget asks a Claude that thinks by a budget for level.
+// An effort the request already names, at the top or on a message, is
+// rewritten so it cannot outrank the budget. max_tokens is raised when it
+// would cut the budget into a lower level (#7389: xhigh's 32000 became
+// 8191 under a cap of 8192, which reads as medium).
+func withAnthropicBudget(body []byte, level string) []byte {
+	return patchAnthropicEffort(body, anthropicPatch{level: level, kind: patchBudget, stripSampling: true})
+}
+
+// patchAnthropicEffort applies p in one decode of the top-level object and
+// one encode. A 2 MiB messages array is not parsed into maps (#7389).
+func patchAnthropicEffort(body []byte, p anthropicPatch) []byte {
+	var m map[string]json.RawMessage
+	if decodeJSON(body, &m) != nil || m == nil {
+		return body
+	}
+	before := thinkingTypeRaw(m["thinking"])
+	switch p.kind {
+	case patchTranslated:
+		setOutputEffortRaw(m, p.level, false)
+		stampMessageEffortsRaw(m, p.level)
+		if !effortThinkingOn(before) {
+			m["thinking"] = []byte(`{"type":"adaptive"}`)
+		}
+	case patchLevel:
+		setOutputEffortRaw(m, p.level, false)
+		stampMessageEffortsRaw(m, p.level)
+		if p.tight && before == "adaptive" {
+			// A cap at or under neededBudget cannot fit an "enabled" budget;
+			// converting adaptive to enabled would turn it into disabled in
+			// withMaxOutput (400 on always-thinking vendors, or max_tokens
+			// inflated past the cap by thinkingOffAsTaken on offNever Claudes).
+			// Keep the client's adaptive thinking at the capped max_tokens (#7389).
+			break
+		}
+		if p.needEnabled {
+			// an upstream that takes only thinking.type enabled is
+			// asked the level's budget on every model, not only an
+			// adaptive Claude: GLM's output_config path and a budget
+			// Claude both used to fall through to the 1024 least
+			forceEnabledBudget(m, p.level)
+			break
+		}
+		if p.adaptive {
+			m["thinking"] = adaptiveThinkingRaw(m["thinking"])
+			break
+		}
+		// the level's full budget, with max_tokens raised past it. A cap
+		// the caller still applies (withMaxOutput, withReplyCap) bounds
+		// that raise; clipping to max_tokens-1 here read xhigh as medium.
+		raiseMaxTokensRaw(m, budgetOf(p.level))
+		applyFixedAnthropicThinking(m, p.level)
+	case patchBudget:
+		setOutputEffortRaw(m, p.level, true)
+		stampMessageEffortsRaw(m, p.level)
+		if p.tight && before == "adaptive" {
+			break
+		}
+		if p.needEnabled {
+			forceEnabledBudget(m, p.level)
+			break
+		}
+		raiseMaxTokensRaw(m, budgetOf(p.level))
+		applyFixedAnthropicThinking(m, p.level)
+	case patchRewriteEffort:
+		// an effort already on the request, and only that: no thinking,
+		// and no output_config.effort the client did not send
+		setOutputEffortRaw(m, p.level, true)
+		stampMessageEffortsRaw(m, p.level)
+	}
+	if p.stripSampling && !effortThinkingOn(before) && effortThinkingOn(thinkingTypeRaw(m["thinking"])) && hasSamplingRaw(m) {
+		delete(m, "temperature")
+		delete(m, "top_p")
+		delete(m, "top_k")
+	}
+	out, ok := marshalRaw(m, false)
+	if !ok {
+		return body
+	}
+	return out
+}
+
+// applyFixedAnthropicThinking is the thinking half of withFixedEffort for
+// Anthropic, on a body whose max_tokens has already been raised past the
+// budget. A budget that still does not fit leaves thinking off.
+func applyFixedAnthropicThinking(m map[string]json.RawMessage, level string) {
+	typ := thinkingTypeRaw(m["thinking"])
+	maxTokens := rawJSONInt(m["max_tokens"])
+	if budget, ok := clippedBudget(level, maxTokens); ok {
+		m["thinking"] = enabledThinkingRaw(budget)
+		return
+	}
+	if typ == "adaptive" {
+		delete(m, "thinking")
+	}
+}
+
+// clippedBudget is the thinking budget for level that still leaves a token
+// under max_tokens. ok is false when that is under Anthropic's least.
+func clippedBudget(level string, maxTokens int) (int, bool) {
+	budget := budgetOf(level)
+	if maxTokens > 0 {
+		budget = min(budget, maxTokens-1)
+	}
+	if budget < neededBudget {
+		return budget, false
+	}
+	return budget, true
+}
+
+// adaptiveThinkingRaw is thinking as a model that thinks only adaptively
+// takes a fixed level. A request that already asks adaptive keeps that
+// object, so Anthropic's default display is not replaced. Converting
+// enabled, or asking thinking that was absent, uses summarized unless the
+// request named a display (adaptiveThinking).
+func adaptiveThinkingRaw(old json.RawMessage) json.RawMessage {
+	var th map[string]json.RawMessage
+	if len(bytes.TrimSpace(old)) > 0 && decodeJSON(old, &th) == nil && th != nil {
+		if thinkingTypeRaw(old) == "adaptive" {
+			return old
+		}
+		out := map[string]json.RawMessage{"type": []byte(`"adaptive"`)}
+		if d := bytes.TrimSpace(th["display"]); len(d) > 0 && !bytes.Equal(d, []byte("null")) {
+			out["display"] = d
+		} else {
+			out["display"] = []byte(`"summarized"`)
+		}
+		if raw, ok := marshalRaw(out, false); ok {
+			return raw
+		}
+	}
+	return []byte(`{"display":"summarized","type":"adaptive"}`)
+}
+
+func enabledThinkingRaw(budget int) json.RawMessage {
+	raw, ok := marshalRaw(map[string]json.RawMessage{
+		"budget_tokens": strconv.AppendInt(nil, int64(budget), 10),
+		"type":          []byte(`"enabled"`),
+	}, false)
+	if !ok {
+		return fmt.Appendf(nil, `{"budget_tokens":%d,"type":"enabled"}`, budget)
+	}
+	return raw
+}
+
+func thinkingTypeRaw(raw json.RawMessage) string {
+	var th struct {
+		Type string `json:"type"`
+	}
+	if decodeJSON(raw, &th) != nil {
+		return ""
+	}
+	return th.Type
+}
+
+func effortThinkingOn(typ string) bool { return typ == "enabled" || typ == "adaptive" }
+
+func rawJSONInt(raw json.RawMessage) int {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] == '"' {
+		return 0
+	}
+	n, err := strconv.ParseInt(string(raw), 10, 64)
+	if err == nil {
+		return int(n)
+	}
+	f, ferr := strconv.ParseFloat(string(raw), 64)
+	if ferr != nil {
+		return 0
+	}
+	return int(f)
+}
+
+// forceEnabledBudget is thinking for an upstream that refused every type
+// but "enabled": the level's full budget, and max_tokens raised past it
+// when the client's cap would cut it. A later withMaxOutput or
+// withReplyCap still bounds that raise.
+func forceEnabledBudget(m map[string]json.RawMessage, level string) {
+	budget := budgetOf(level)
+	raiseMaxTokensRaw(m, budget)
+	m["thinking"] = enabledThinkingRaw(budget)
+}
+
+func raiseMaxTokensRaw(m map[string]json.RawMessage, budget int) {
+	n := rawJSONInt(m["max_tokens"])
+	if n > 0 && n <= budget {
+		m["max_tokens"] = strconv.AppendInt(nil, int64(budget+max(n, 1)), 10)
+	}
+}
+
+func hasSamplingRaw(m map[string]json.RawMessage) bool {
+	for _, k := range []string{"temperature", "top_p", "top_k"} {
+		v := bytes.TrimSpace(m[k])
+		if len(v) > 0 && !bytes.Equal(v, []byte("null")) {
+			return true
+		}
+	}
+	return false
+}
+
+// setOutputEffortRaw sets output_config.effort to level, keeping every
+// other key as raw JSON so a schema integer past 2^53 is not rounded.
+// onlyExisting leaves a request that named no effort without the field.
+func setOutputEffortRaw(m map[string]json.RawMessage, level string, onlyExisting bool) {
+	rawLevel, err := json.Marshal(level)
+	if err != nil {
+		return
+	}
+	var oc map[string]json.RawMessage
+	if len(bytes.TrimSpace(m["output_config"])) > 0 && decodeJSON(m["output_config"], &oc) != nil {
+		return
+	}
+	effort := bytes.TrimSpace(oc["effort"])
+	has := oc != nil && len(effort) > 0 && !bytes.Equal(effort, []byte("null"))
+	if onlyExisting && !has {
+		return
+	}
+	if has {
+		var cur string
+		if decodeJSON(effort, &cur) == nil && cur == level {
+			return
+		}
+	}
+	if oc == nil {
+		oc = map[string]json.RawMessage{}
+	}
+	oc["effort"] = rawLevel
+	if out, ok := marshalRaw(oc, false); ok {
+		m["output_config"] = out
+	}
+}
+
+// outputConfigKey and unicodeEscape are the needles mayContainKey scans
+// for. A fresh []byte(key) on every request would show up in the budget
+// benchmark; these do not.
+var (
+	outputConfigKey = []byte("output_config")
+	unicodeEscape   = []byte(`\u`)
+)
+
+// mayContainKey reports whether raw may hold key, including a \uXXXX
+// spelling of it. The literal is enough when it is present. A body with
+// no \u, or whose escapes are not characters of key, is rejected without
+// decoding strings, so a 2 MiB messages array is not parsed because user
+// text contains \u003c (#7389).
+func mayContainKey(raw []byte, key string) bool {
+	if key == "" || len(raw) < len(key) {
+		return false
+	}
+	needle := outputConfigKey
+	if key != "output_config" {
+		needle = []byte(key)
+	}
+	if bytes.Contains(raw, needle) {
+		return true
+	}
+	if !bytes.Contains(raw, unicodeEscape) {
+		return false
+	}
+	var need [256]bool
+	for i := 0; i < len(key); i++ {
+		need[key[i]] = true
+	}
+	if !escapeHitsKey(raw, &need) {
+		return false
+	}
+	return decodedContainsKey(raw, key)
+}
+
+// escapeHitsKey reports whether a \uXXXX in raw decodes to a byte of key.
+func escapeHitsKey(raw []byte, need *[256]bool) bool {
+	for i := 0; i+6 <= len(raw); i++ {
+		if raw[i] != '\\' || raw[i+1] != 'u' {
+			continue
+		}
+		r := hex4(raw[i:])
+		if r >= 0 && r < 256 && need[byte(r)] {
+			return true
+		}
+	}
+	return false
+}
+
+// decodedContainsKey reports whether any JSON string in raw decodes to a
+// value that contains key. key is at most 64 bytes; a longer one is
+// treated as present so the caller parses and checks for itself.
+func decodedContainsKey(raw []byte, key string) bool {
+	n := len(key)
+	if n == 0 || n > 64 {
+		return true
+	}
+	var pi [64]int
+	for i, l := 1, 0; i < n; i++ {
+		for l > 0 && key[i] != key[l] {
+			l = pi[l-1]
+		}
+		if key[i] == key[l] {
+			l++
+		}
+		pi[i] = l
+	}
+	matched := 0
+	inStr := false
+	step := func(c byte) bool {
+		for matched > 0 && key[matched] != c {
+			matched = pi[matched-1]
+		}
+		if key[matched] == c {
+			matched++
+		}
+		return matched == n
+	}
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if !inStr {
+			if c == '"' {
+				inStr = true
+				matched = 0
+			}
+			continue
+		}
+		if c == '"' {
+			inStr = false
+			continue
+		}
+		if c != '\\' {
+			if c < 0x20 {
+				matched = 0
+				continue
+			}
+			if step(c) {
+				return true
+			}
+			continue
+		}
+		if i+1 >= len(raw) {
+			return false
+		}
+		i++
+		var dec byte
+		switch raw[i] {
+		case '"', '\\', '/':
+			dec = raw[i]
+		case 'b':
+			dec = '\b'
+		case 'f':
+			dec = '\f'
+		case 'n':
+			dec = '\n'
+		case 'r':
+			dec = '\r'
+		case 't':
+			dec = '\t'
+		case 'u':
+			if i+4 >= len(raw) {
+				return false
+			}
+			r := hex4(raw[i-1:])
+			i += 4
+			if r < 0 || r > 127 {
+				matched = 0
+				continue
+			}
+			dec = byte(r)
+		default:
+			matched = 0
+			continue
+		}
+		if step(dec) {
+			return true
+		}
+	}
+	return false
+}
+
+// stampMessageEffortsRaw rewrites every message output_config.effort to
+// level. A message that names none is left alone, and messages are not
+// parsed at all when none of them names output_config: a relay refuses an
+// output_config on a message that did not have one.
+func stampMessageEffortsRaw(m map[string]json.RawMessage, level string) {
+	raw := m["messages"]
+	if len(raw) == 0 || !mayContainKey(raw, "output_config") {
+		return
+	}
+	var msgs []json.RawMessage
+	if decodeJSON(raw, &msgs) != nil {
+		return
+	}
+	rawLevel, err := json.Marshal(level)
+	if err != nil {
+		return
+	}
+	changed := false
+	for i, msgRaw := range msgs {
+		if !mayContainKey(msgRaw, "output_config") {
+			continue
+		}
+		var msg map[string]json.RawMessage
+		if decodeJSON(msgRaw, &msg) != nil {
+			continue
+		}
+		var oc map[string]json.RawMessage
+		if decodeJSON(msg["output_config"], &oc) != nil || oc == nil {
+			continue
+		}
+		effort := bytes.TrimSpace(oc["effort"])
+		if len(effort) == 0 || bytes.Equal(effort, []byte("null")) {
+			continue
+		}
+		var cur string
+		if decodeJSON(effort, &cur) != nil || cur == level {
+			continue
+		}
+		oc["effort"] = rawLevel
+		ocRaw, ok := marshalRaw(oc, false)
+		if !ok {
+			continue
+		}
+		msg["output_config"] = ocRaw
+		msgOut, ok := marshalRaw(msg, false)
+		if !ok {
+			continue
+		}
+		msgs[i] = msgOut
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	if out, ok := marshalRaw(msgs, false); ok {
+		m["messages"] = out
+	}
+}
+
+// clearOutputEfforts drops output_config.effort at the top and on every
+// message, and the object when effort was all it held. Thinking off with
+// the request's effort left in place is still asked at that effort.
+func clearOutputEfforts(m map[string]any) bool {
+	changed := false
+	drop := func(holder map[string]any) {
+		oc, _ := holder["output_config"].(map[string]any)
+		if oc == nil {
+			return
+		}
+		if _, has := oc["effort"]; has {
+			delete(oc, "effort")
+			changed = true
+		}
+		if len(oc) == 0 {
+			delete(holder, "output_config")
+		}
+	}
+	drop(m)
+	msgs, _ := m["messages"].([]any)
+	for _, raw := range msgs {
+		if msg, _ := raw.(map[string]any); msg != nil {
+			drop(msg)
+		}
+	}
+	return changed
+}
+
+// thinkingAsked is whether body asks to think (enabled or adaptive).
+func thinkingAsked(body []byte) bool {
+	var v struct {
+		Thinking *struct {
+			Type string `json:"type"`
+		} `json:"thinking"`
+	}
+	if decodeJSON(body, &v) != nil || v.Thinking == nil {
+		return false
+	}
+	return v.Thinking.Type == "enabled" || v.Thinking.Type == "adaptive"
+}
+
+// editJSON decodes body as an object, and when fn changes it encodes it
+// again with HTML left as it was. Unchanged, or not an object, body is
+// returned as it came.
+func editJSON(body []byte, fn func(map[string]any) bool) []byte {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var m map[string]any
+	if dec.Decode(&m) != nil || !fn(m) {
+		return body
+	}
+	var out bytes.Buffer
+	enc := json.NewEncoder(&out)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(m) != nil {
+		return body
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n"))
 }
 
 // withGeminiEffort asks a Gemini request's generationConfig.thinkingConfig

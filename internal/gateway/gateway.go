@@ -2340,8 +2340,9 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	r = withWires(r)
 	if level := desktopSubagentEffort(r, agentOf(r), body, pick); level != "" && ok && !provider.Reasonless(p.ID, model) {
-		body = withFixedEffort(provider.Anthropic, body, fitLevel(level, p.Efforts(model)))
+		body = withModelEffortAt(provider.Anthropic, body, p.VendorHost(), effortShapeModelAt(wiresOf(r.Context()), p, model), fitLevel(level, p.Efforts(model)), p.Efforts(model), false)
 	}
 	s.countOn(w, r, p, model, ok, body)
 }
@@ -2402,10 +2403,13 @@ func (s *Server) countOn(w http.ResponseWriter, r *http.Request, p provider.Prov
 		}
 	}
 	// the names in force, read at most once however many candidates are
-	// counted, and not at all where there are none
-	wires := sync.OnceValue(func() map[string]string { return settings.Shared().Wires() })
+	// counted, and not at all where there are none. Reuse countTokens'
+	// snapshot when present so effort shaping and model rewrite agree (#7389).
+	if r.Context().Value(wiresKey{}) == nil {
+		r = withWires(r)
+	}
 	for i, c := range counts {
-		res, err := s.forward(r.Context(), c.p, provider.Anthropic, "/v1/messages/count_tokens", rewriteModel(body, provider.UpstreamNameAsIn(wires(), c.p.ID, model, c.p.SentIDAt(model, sentEffortIf(c.p, model, provider.Anthropic, body)))), r.Header)
+		res, err := s.forward(r.Context(), c.p, provider.Anthropic, "/v1/messages/count_tokens", rewriteModel(body, provider.UpstreamNameAsIn(wiresOf(r.Context()), c.p.ID, model, c.p.SentIDAt(model, sentEffortIf(c.p, model, provider.Anthropic, body)))), r.Header)
 		if tooMany := (*errRPM)(nil); errors.As(err, &tooMany) {
 			break // its minute filled since: nobody rests, the estimate answers
 		}
@@ -2482,6 +2486,9 @@ func (s *Server) handle(from provider.Protocol) http.HandlerFunc {
 		if !ok {
 			return
 		}
+		// WithSideEffort's level is keyed by these bytes. onRequest,
+		// requestModel and redaction below all rewrite body (#7389).
+		r = r.WithContext(stashSideEffort(r.Context(), body))
 		var err error
 		var model string
 		body, model, err = requestModel(body)
@@ -2698,6 +2705,10 @@ func estimate(req *Request) int {
 // serve routes one parsed-enough request to its provider.
 func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Protocol, body []byte) {
 	start := time.Now()
+	// the level WithSideEffort asked, looked up on the bytes that arrived
+	// before anything below rewrites them. A direct serve (a search, a
+	// title) looks its own body up; an agent's request already did, in handle.
+	sideMeta, sideHit := takeSideEffort(r.Context(), body)
 	// a client's "off" is magpie's none, for every route and check below
 	// that reads the body's effort (plugins#334)
 	body = offAsNone(from, body)
@@ -4313,12 +4324,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// (groupEntries); each member is asked for no more than its own.
 		// Outside a group only the user's own Max output lowers a request
 		// (userOutput): a vendor's figure may be stale, the user's is asked
+		maxOut := 0
 		if isGroup {
-			if n := outputLimit(c.p, c.model); n > 0 {
-				attemptBody = withMaxOutput(from, attemptBody, n)
-			}
-		} else if n := userOutput(c.p, c.model); n > 0 {
-			attemptBody = withMaxOutput(from, attemptBody, n)
+			maxOut = outputLimit(c.p, c.model)
+		} else {
+			maxOut = userOutput(c.p, c.model)
+		}
+		if maxOut > 0 {
+			attemptBody = withMaxOutput(from, attemptBody, maxOut)
 		}
 		// a request naming no reply limit, to an API that would cut it
 		// short (DeepSeek's 8K), asks for the model's own, relayed or
@@ -4335,6 +4348,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				attemptBody = b
 			}
 		}
+		preEffortBody := attemptBody
 		picked := false // the effort asked for in place of the agent's
 		// a member fixed at an effort (#189), else the model asked for at
 		// one (#536)
@@ -4362,6 +4376,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// one, a suffix and the turn's pick are more particular
 			fixed = withinLevels(agentPick, levels)
 		}
+		efforts := c.p.Efforts(c.model)
 		// a member that sends another level than the one asked (its
 		// EffortMaps, LuckymanJC on Discord: one vendor's high is
 		// another's xhigh) is sent that, whoever asked: a suffix, the
@@ -4373,61 +4388,31 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			if in == "" && effort != "" {
 				in = withinLevels(effort, levels)
 			}
-			if in == "" {
+			if in == "" && from == provider.Anthropic && sideHit && sideMeta.active() {
+				// evaluate EffortMaps against WithSideEffort's requested level
+				// before fitting to this candidate's native efforts (mirroring
+				// non-side requests where EffortMaps runs before fitLevel);
+				// fall back to the restored base when this candidate has no
+				// known efforts (#7389).
+				if len(efforts) > 0 {
+					in = withinLevels(cmp.Or(sideMeta.want, sideMeta.effort), levels)
+				} else {
+					in = withinLevels(askedLevel(from, restoreSideEffortBase(attemptBody, sideMeta)), levels)
+				}
+			} else if in == "" {
 				in = withinLevels(askedLevel(from, attemptBody), levels)
 			}
 			if to, ok := mappedLevel(c.effortMap, in); ok {
 				mappedFrom, mapped = in, to
 			}
 		}
-		if mapped != "" {
-			// "none" turns its reasoning off; another level is asked at
-			// the one its model has nearest, as a fixed member's is
-			efforts := c.p.Efforts(c.model)
-			if mapped != "none" {
-				mapped = fitLevel(mapped, efforts)
-			}
-			attemptBody = withModelEffort(from, attemptBody, c.model, mapped, efforts)
-		} else if ruled != "" {
-			// asked even of a request that asked for no reasoning, as a
-			// member fixed at an effort is; already fitted to its levels
-			attemptBody = withModelEffort(from, attemptBody, c.model, ruled, c.p.Efforts(c.model))
-		} else if fixed != "" {
-			// a member fixed at an effort is asked for it, at the level its
-			// model has nearest, whatever the agent asked or the turn's
-			// pick: even a request that asked for no reasoning
-			efforts := c.p.Efforts(c.model)
-			attemptBody = withModelEffort(from, attemptBody, c.model, fitLevel(fixed, efforts), efforts)
-		} else if effort != "" {
-			// the level this model has nearest to the one picked; one whose
-			// levels aren't known isn't asked for more than high, which
-			// every vendor with levels takes. The conversation kept a
-			// higher one for its cache (keepsEffort) unless an effort
-			// update carries the turn's own without losing it.
-			pick := effort
-			if wanted != "" && from == provider.Responses && plainFor != c.who()+"|"+c.model && takesEffortUpdates(c.p, c.model) {
-				pick = wanted
-			}
-			if b := withEffort(from, attemptBody, fitLevel(withinLevels(pick, levels), c.p.Efforts(c.model))); !bytes.Equal(b, attemptBody) {
-				attemptBody, picked = b, true
-			}
-		} else if e := agentEffort(from, attemptBody); e != "" && e != "none" {
-			// the agent's own level, where the group doesn't offer it
-			if want := withinLevels(e, levels); want != e {
-				attemptBody = withEffort(from, attemptBody, want)
-			}
+		if mapped != "" && mapped != "none" {
+			mapped = fitLevel(mapped, efforts)
 		}
 		// a member sent fast is, in its vendor's words, where its model
 		// has a fast mode; else it goes as the agent asked
 		fast := c.fast && provider.CanFast(c.p, c.model)
 		ownFast := fast && provider.OwnFast(c.p, c.model)
-		if fast && (!ownFast || from == provider.Chat || from == provider.Responses) {
-			// the user's own provider is never sent Claude's speed "fast"
-			// in the agent's words, which a relay of theirs may turn
-			// away: it is asked for priority on its OpenAI API (#1615,
-			// forwardTranslated)
-			attemptBody = withFast(from, attemptBody)
-		}
 		// a pick sent Ultrafast (#1954) asks for it in OpenAI's words; in
 		// Claude's, which have none, the try carries it (withUltra). So
 		// does one sent fast on a provider whose extra body asks for
@@ -4437,9 +4422,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// a provider the user added by its address it is asked for as its
 		// Fast is (OwnFast), and turned away, asked again without it
 		ultra := fast && (c.ultra || extraUltra(c.p))
-		if ultra && (from == provider.Chat || from == provider.Responses) {
-			attemptBody = withFields(attemptBody, map[string]any{"service_tier": "ultrafast"})
-		}
 		// a member known not to think is sent no reasoning ask (#950): the
 		// group reasons for the members that do, and asking one that can't
 		// is what some vendors turn away with a 400. Every other field goes
@@ -4447,19 +4429,252 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// One the user fixed at an effort is left as it is: that is the
 		// user saying this model does think, over a catalog that may be
 		// wrong about it (the Trae plugin's own model, #950)
-		quiet := isGroup && c.effort == "" && len(c.levels) == 0 && quietTo(c.p.ID, c.model)
-		if provider.Reasonless(c.p.ID, c.model) {
-			// a model the user said takes no reasoning ask is sent none,
-			// in a group or not, at a fixed effort or not: not even
-			// reasoning turned off (yuexian7 on Discord: its vendor
-			// answers reasoning_effort with 422)
-			quiet = true
-			attemptBody, picked = withoutAnyReasoning(from, attemptBody), false
-		} else if quiet {
-			attemptBody, picked = withoutReasoningAsk(from, attemptBody), false
+		reasonless := provider.Reasonless(c.p.ID, c.model)
+		quiet := reasonless || (isGroup && c.effort == "" && len(c.levels) == 0 && quietTo(c.p.ID, c.model))
+		// the vendor's name decides a budget Claude from one asked in
+		// output_config.effort; a local alias is not that name. The
+		// turn's wire snapshot, and only once a level is actually asked:
+		// a candidate that is not shaping effort does not look a name up
+		// (#7389).
+		var (
+			shape      string
+			shapeReady bool
+		)
+		effortShape := func() string {
+			if !shapeReady {
+				shapeReady = true
+				shape = effortShapeModelAt(wiresOf(r.Context()), c.p, c.model)
+			}
+			return shape
 		}
-		// the reasoning the model is asked for, whoever chose it
+		// sideLevel asks a native Anthropic candidate in its own shape
+		// when WithSideEffort's body was built for another member. Empty
+		// when a rule, a fixed member or an effort map wins, and when
+		// this candidate is translated.
+		sideLevel := ""
+		// askedLevel is the level this candidate was rewritten to, when
+		// that rewrite ran. max and xhigh share a budget, so the body
+		// alone reads max back as xhigh (#7389).
+		askedLevel := ""
+		recordAsked := true
+		applyAttemptBody := func(base []byte, translated bool) ([]byte, bool) {
+			out := base
+			outPicked := false
+			ask := func(level string) []byte {
+				if recordAsked {
+					askedLevel = level
+				}
+				shaped := effortShape()
+				if from == provider.Anthropic {
+					// an upstream that answered thinking.type must be
+					// "enabled" is asked that, even for a Claude that
+					// otherwise thinks only adaptively (#7389). The
+					// vendor's name is marked too. Sampling is dropped
+					// after withMaxOutput, which may turn the thinking
+					// this just enabled back off. A Max output or reply
+					// cap that cannot hold the least budget does not
+					// synthesize the thinking that cap would turn off.
+					needEnabled := !translated && s.thinkingNeededMarked(c.p.ID, c.model, shaped, provider.Anthropic)
+					cap := 0
+					if maxOut > 0 {
+						cap = maxOut
+					}
+					if roomFor == c.who()+"|"+c.model && roomCap > 0 && (cap == 0 || roomCap < cap) {
+						cap = roomCap
+					}
+					tight := !translated && cap > 0 && cap <= neededBudget
+					return withAnthropicFixedMode(out, c.p.VendorHost(), shaped, level, translated, needEnabled, false, tight)
+				}
+				return withModelEffortAt(from, out, c.p.VendorHost(), shaped, level, efforts, translated)
+			}
+			// a model the user said takes no reasoning, and one known not
+			// to think, is not rewritten first: a fixed effort would raise
+			// max_tokens and drop temperature, top_p and top_k, and the
+			// strip below does not put them back (#7389)
+			if !reasonless && !quiet {
+				if mapped != "" {
+					// "none" turns its reasoning off; another level is asked at
+					// the one its model has nearest, as a fixed member's is
+					out = ask(mapped)
+				} else if ruled != "" {
+					// asked even of a request that asked for no reasoning, as a
+					// member fixed at an effort is; already fitted to its levels
+					out = ask(ruled)
+				} else if fixed != "" {
+					// a member fixed at an effort is asked for it, at the level its
+					// model has nearest, whatever the agent asked or the turn's
+					// pick: even a request that asked for no reasoning
+					out = ask(fitLevel(fixed, efforts))
+				} else if sideLevel != "" {
+					if !translated {
+						// WithSideEffort's level, in this candidate's native
+						// Anthropic shape: a budget, or adaptive thinking
+						out = ask(sideLevel)
+					} else if recordAsked {
+						askedLevel = sideLevel
+					}
+				} else if effort != "" {
+					// the level this model has nearest to the one picked; one whose
+					// levels aren't known isn't asked for more than high, which
+					// every vendor with levels takes. The conversation kept a
+					// higher one for its cache (keepsEffort) unless an effort
+					// update carries the turn's own without losing it.
+					pick := effort
+					if wanted != "" && from == provider.Responses && plainFor != c.who()+"|"+c.model && takesEffortUpdates(c.p, c.model) {
+						pick = wanted
+					}
+					level := fitLevel(withinLevels(pick, levels), efforts)
+					if b := withEffort(from, out, level); !bytes.Equal(b, out) {
+						out, outPicked = b, true
+						if recordAsked {
+							askedLevel = level
+						}
+					}
+				} else if e := agentEffort(from, out); e != "" && e != "none" {
+					// the agent's own level, where the group doesn't offer it
+					if want := withinLevels(e, levels); want != e {
+						out = withEffort(from, out, want)
+						if recordAsked {
+							askedLevel = want
+						}
+					}
+				}
+			}
+			// Keep a budget-raised Anthropic max_tokens within the member's
+			// output limit and any context-window reply cap (#7389).
+			if from == provider.Anthropic {
+				if maxOut > 0 {
+					out = withMaxOutput(from, out, maxOut)
+				}
+				if roomFor == c.who()+"|"+c.model {
+					if b, ok := withReplyCap(from, out, roomCap); ok {
+						out = b
+					}
+				}
+				// after the cap has settled whether thinking is still on.
+				// skipped when translated (parseTranslated reads the
+				// synthetic adaptive marker; anthropicBody drops sampling
+				// only if thinking is actually emitted) or when nothing
+				// above enabled thinking: a reasonless model keeps its
+				// sampling (#7389)
+				if !translated && !reasonless && !quiet {
+					out = withoutThinkingSampling(base, out)
+				}
+			}
+			if fast && (!ownFast || from == provider.Chat || from == provider.Responses) {
+				// the user's own provider is never sent Claude's speed "fast"
+				// in the agent's words, which a relay of theirs may turn
+				// away: it is asked for priority on its OpenAI API (#1615,
+				// forwardTranslated)
+				out = withFast(from, out)
+			}
+			if ultra && (from == provider.Chat || from == provider.Responses) {
+				out = withFields(out, map[string]any{"service_tier": "ultrafast"})
+			}
+			if reasonless {
+				// a model the user said takes no reasoning ask is sent none,
+				// in a group or not, at a fixed effort or not: not even
+				// reasoning turned off (yuexian7 on Discord: its vendor
+				// answers reasoning_effort with 422)
+				out, outPicked = withoutAnyReasoning(from, out), false
+			} else if quiet {
+				out, outPicked = withoutReasoningAsk(from, out), false
+			}
+			return out, outPicked
+		}
+		translatedAnthropic := from == provider.Anthropic &&
+			((c.p.Account != nil && c.p.Account.Agent == "claude") ||
+				!slices.Contains(s.usable(c.p, c.model), provider.Anthropic))
+		// WithSideEffort remembered the level and the caller's max_tokens.
+		// A rule, a fixed member or an effort map wins: put that base back
+		// before asking, so +32000 never becomes the limit those raise
+		// from. With no override, a native Anthropic candidate is asked
+		// in its own shape (a Chat-first side body is adaptive, which a
+		// budget Claude refuses), and a translation keeps the exact level
+		// at the caller's max_tokens (#7389).
+		sideOverride := mapped != "" || ruled != "" || fixed != ""
+		attemptBase := preEffortBody
+		clientBase := preEffortBody
+		sideFit := ""
+		if from == provider.Anthropic && sideHit && sideMeta.active() {
+			clientBase = restoreSideEffortBase(preEffortBody, sideMeta)
+			attemptBase = clientBase
+			if sideOverride {
+				overrideLevel := ""
+				if mapped != "" {
+					overrideLevel = mapped
+				} else if ruled != "" {
+					overrideLevel = ruled
+				} else if fixed != "" {
+					overrideLevel = fitLevel(fixed, efforts)
+				}
+				if !translatedAnthropic && !reasonless && !quiet && sideMeta.hadMaxTokens && sideMeta.origMaxTokens > 0 && overrideLevel != "" && overrideLevel != "none" && (!forcedAnthropicToolChoice(attemptBase) || thinkingAsked(attemptBase)) {
+					roomLevel := overrideLevel
+					if roomLevel == "minimal" && !anthropicAdaptive(effortShapeModelAt(wiresOf(r.Context()), c.p, c.model)) {
+						roomLevel = effortOf(roomLevel)
+					}
+					attemptBase = withFields(attemptBase, map[string]any{"max_tokens": replyRoom(sideMeta.origMaxTokens, roomLevel)})
+				}
+			} else if !reasonless && !quiet {
+				sideFit = sideEffortLevelFor(sideMeta, efforts)
+				if sideFit != "" {
+					sideLevel = sideFit
+					if !translatedAnthropic && sideMeta.hadMaxTokens && sideMeta.origMaxTokens > 0 && sideFit != "none" && (!forcedAnthropicToolChoice(attemptBase) || thinkingAsked(attemptBase)) {
+						roomLevel := sideFit
+						if roomLevel == "minimal" && !anthropicAdaptive(effortShapeModelAt(wiresOf(r.Context()), c.p, c.model)) {
+							roomLevel = effortOf(roomLevel)
+						}
+						attemptBase = withFields(attemptBase, map[string]any{"max_tokens": replyRoom(sideMeta.origMaxTokens, roomLevel)})
+					}
+				}
+			}
+		}
+		var sideFallback []byte
+		if from == provider.Anthropic && !sideOverride && sideHit && sideFit != "" && !reasonless && !quiet {
+			sideFallback = applySideEffortMeta(preEffortBody, sideMeta, sideFit)
+			if maxOut > 0 {
+				sideFallback = withMaxOutput(from, sideFallback, maxOut)
+			}
+			if roomFor == c.who()+"|"+c.model {
+				if b, ok := withReplyCap(from, sideFallback, roomCap); ok {
+					sideFallback = b
+				}
+			}
+		}
+		if len(sideFallback) > 0 && translatedAnthropic {
+			attemptBody, picked = applyAttemptBody(sideFallback, true)
+		} else {
+			attemptBody, picked = applyAttemptBody(attemptBase, translatedAnthropic)
+		}
+		// A rule, a fixed member, an effort map or WithSideEffort asked for
+		// an override whose native budget shape loses max against xhigh and
+		// raises max_tokens. The translated body keeps the exact level at the
+		// caller's max_tokens, including when translate runs on an
+		// Anthropic-only relay (stream-only account, web search). A client's
+		// own effort (even clamped by Group.Levels) is NOT an override (#7389).
+		effortOverride := from == provider.Anthropic && !reasonless && !quiet && (len(sideFallback) > 0 || sideOverride)
+		var translatedFallback []byte
+		if from == provider.Anthropic && !translatedAnthropic && (len(c.p.Speaks()) > 1 || effortOverride) {
+			base := preEffortBody
+			if len(sideFallback) > 0 {
+				base = sideFallback
+			} else if sideHit && sideMeta.active() {
+				base = restoreSideEffortBase(preEffortBody, sideMeta)
+			}
+			recordAsked = false
+			translatedFallback, _ = applyAttemptBody(base, true)
+		}
+		effectiveMaxOut := maxOut
+		if roomFor == c.who()+"|"+c.model && roomCap > 0 && (effectiveMaxOut == 0 || roomCap < effectiveMaxOut) {
+			effectiveMaxOut = roomCap
+		}
+		// the reasoning the model is asked for, whoever chose it.
+		// a budget of 32000 is xhigh and max; the level just applied is
+		// the one the route and the ledger record (#7389)
 		sent = sentEffort(from, attemptBody, c.p, c.model)
+		if sent == "xhigh" && askedLevel == "max" {
+			sent = "max"
+		}
 		if !takesEffort(c, sent) {
 			if j := effortMate(cands[i+1:], c, sent); j >= 0 {
 				// its plan doesn't take this level, which another account
@@ -4581,6 +4796,17 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// a stream that fails before anything is said is let go at
 			// once (hw.stop), not read on until the vendor hangs up
 			ctx, stop := context.WithCancel(withWireAt(r.Context(), at))
+			// Write every per-attempt field unconditionally so a nested serve
+			// (web search, advisor) on a child context never inherits an outer
+			// translated body, override flag or max_output cap (#7389).
+			ctx = withAnthropicAttempt(ctx, anthropicAttemptState{
+				translatedBody:    translatedFallback,
+				effortOverride:    effortOverride,
+				syntheticThinking: effortOverride && !thinkingAsked(clientBase),
+				sideReplyRoom:     effortOverride && sideHit && sideMeta.active() && sideMeta.hadMaxTokens && sideMeta.origMaxTokens > 0,
+				maxOut:            effectiveMaxOut,
+				hasMaxOut:         true,
+			})
 			if isGroup {
 				ctx = groupTry(ctx)
 			}
@@ -6382,7 +6608,42 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 		return writePrevNotFound(w, id)
 	}
 	call.To = to[0]
+	// the translated body, whenever translate runs: a Chat fallback, and
+	// an Anthropic rebuild that would otherwise parse the budget and the
+	// raised max_tokens (#7389). A relay never reaches here.
+	if from == provider.Anthropic {
+		if st, ok := anthropicAttemptOf(r.Context()); ok && len(st.translatedBody) > 0 {
+			body = st.translatedBody
+		}
+	}
 	return s.translate(w, r, p, from, to[0], model, body, &call.Usage)
+}
+
+type anthropicAttemptState struct {
+	translatedBody    []byte
+	effortOverride    bool
+	syntheticThinking bool
+	sideReplyRoom     bool
+	maxOut            int
+	hasMaxOut         bool
+}
+
+type anthropicAttemptKey struct{}
+
+func withAnthropicAttempt(ctx context.Context, st anthropicAttemptState) context.Context {
+	return context.WithValue(ctx, anthropicAttemptKey{}, st)
+}
+
+func anthropicAttemptOf(ctx context.Context) (anthropicAttemptState, bool) {
+	st, ok := ctx.Value(anthropicAttemptKey{}).(anthropicAttemptState)
+	return st, ok
+}
+
+func attemptMaxOut(ctx context.Context, p provider.Provider, model string) int {
+	if st, ok := anthropicAttemptOf(ctx); ok && st.hasMaxOut {
+		return st.maxOut
+	}
+	return userOutput(p, model)
 }
 
 // firstElsewhere is whether model is best asked on an API other than
@@ -6669,8 +6930,12 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 		if to == provider.Anthropic && !bytes.Equal(extra, body) {
 			// a thinking budget the user's fields put in is fitted to a
 			// model that thinks only adaptively as the agent's is, its
-			// display to the provider
-			extra = s.withoutRefusedShapes(p, adaptiveThinking(extra))
+			// display to the provider — except when the upstream refused
+			// adaptive and asked for thinking.type "enabled" (#7389)
+			if m := modelOf(extra); m == "" || s.fits(p.ID, thinkingNeeded(m), to) {
+				extra = adaptiveThinking(extra)
+			}
+			extra = s.withoutRefusedShapes(p, extra)
 		}
 		body = extra
 	}
@@ -7294,14 +7559,14 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			// turns the whole request away for (#1611)
 			body = withThinkingOnToolTurns(body)
 		}
-		if !anthropicModel.MatchString(model) && !provider.Reasonless(p.ID, model) {
+		if !ThinksOnlyWhenAsked(model) && !ThinksOnlyWhenAsked(upstream) && !provider.Reasonless(p.ID, model) {
 			body = thinkingOffUnlessAsked(body)
 			// Claude Code's auto mode classifier, on a vendor's model that
 			// may think whatever it is told (#250); a Claude model's request
 			// goes as it was sent, safeguards and all
-			body = autoModeClassifierBody(model, body)
+			body = autoModeClassifierBody(cmp.Or(upstream, model), body)
 		}
-		if outputEffortAt(p.VendorHost(), model) {
+		if outputEffortAt(p.VendorHost(), model) || outputEffortAt(p.VendorHost(), upstream) {
 			levels := p.Efforts(model)
 			if len(levels) == 0 && p.VendorHost() == deepseekHost {
 				levels = deepseekEfforts
@@ -7316,10 +7581,17 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 				body = nb
 			}
 		}
-		if !s.fits(p.ID, thinkingNeeded(model), proto) {
-			// a model whose upstream said thinking must be enabled (below):
-			// sent thinking from the start, not refused on every request
-			if nb, ok := withThinkingEnabled(body); ok {
+		if s.thinkingNeededMarked(p.ID, model, upstream, proto) {
+			if !s.thinkingNeededBothMarked(p.ID, model, upstream, proto) {
+				s.markThinkingNeeded(p, proto, model, upstream)
+			}
+			// a model whose upstream said thinking must be enabled (below),
+			// by the name magpie knows or the vendor's: sent thinking from
+			// the start, not refused on every request. Adaptive thinking
+			// is that refusal too, so it becomes enabled at its level (#7389).
+			if nb, ok := withThinkingEnabledCapped(body, attemptMaxOut(r.Context(), p, model)); ok {
+				body = nb
+			} else if nb, ok := withAdaptiveAsEnabledCapped(body, attemptMaxOut(r.Context(), p, model)); ok {
 				body = nb
 			}
 		}
@@ -7392,7 +7664,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	body = xaiBody(p, proto, body)
 	// a Gemini 3 or later on an Anthropic or Chat relay is asked a
 	// thinking level, never a budget (gemini_level_body.go)
-	body = geminiLevelBody(p, proto, model, body)
+	body = geminiLevelBody(p, proto, model, cmp.Or(upstream, model), body)
 	// a Grok subscription is given Codex's namespaced functions flat
 	// (grokBody), and Zed's plugin likewise (ZedBody); a call to one goes
 	// back under its namespace (#404). Any vendor asked as Codex sends it
@@ -7809,7 +8081,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			if offEffort(e) {
 				s.markUnfit(p.ID, offRefused(model), proto)
 			}
-			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(withModelEffort(proto, body, model, onEffort(p, model), p.Efforts(model))), r.Header); err != nil {
+			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(withModelEffortAt(proto, body, p.VendorHost(), effortShapeModelAt(wiresOf(r.Context()), p, model), onEffort(p, model), p.Efforts(model), false)), r.Header); err != nil {
 				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
 			}
 		}
@@ -7859,13 +8131,28 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(nb), r.Header); err != nil {
 				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
 			}
-		} else if nb, ok := withThinkingEnabled(body); ok && thinkingNeededRefusal.Match(b) {
+		} else if nb, ok := withThinkingEnabledCapped(body, attemptMaxOut(r.Context(), p, model)); ok && thinkingNeededRefusal.Match(b) {
 			// thinking left out or off, turned away by an upstream that
 			// takes the model only thinking (Claude Desktop's check, a
 			// title): asked again thinking at the least budget, and so
 			// from then on
 			s.markThinkingNeeded(p, proto, model, upstream)
 			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(nb), r.Header); err != nil {
+				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
+			}
+		} else if nb, ok := withAdaptiveAsEnabledCapped(body, attemptMaxOut(r.Context(), p, model)); ok && thinkingNeededRefusal.Match(b) {
+			// a rule asked adaptive thinking before this upstream had
+			// said it takes only "enabled": asked again at that level's
+			// budget, and so from then on (#7389)
+			s.markThinkingNeeded(p, proto, model, upstream)
+			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(nb), r.Header); err != nil {
+				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
+			}
+		} else if thinkingNeededRefusal.Match(b) && gjson.GetBytes(body, "thinking.type").String() == "enabled" && !s.thinkingNeededBothMarked(p.ID, model, upstream, proto) {
+			// forwardOnce turned the caller's "enabled" thinking into "adaptive"
+			// on an adaptive Claude; mark the upstream so the retry keeps "enabled" (#7389)
+			s.markThinkingNeeded(p, proto, model, upstream)
+			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(body), r.Header); err != nil {
 				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
 			}
 		} else if nb, ok := withoutSampling(body); ok && samplingDeprecated.Match(b) {
@@ -8798,7 +9085,11 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		if to == provider.Anthropic && req.ThinkOff && !s.fits(p.ID, offRefused(model), to) {
 			req = thinkingBackOn(p, model, req)
 		}
-		if to != provider.Anthropic && (req.ThinkOff || req.Effort == "" || offEffort(req.Effort)) && !s.fits(p.ID, thinkingNeeded(model), to) {
+		wireHint := provider.UpstreamNameAsIn(wires, p.ID, model, p.SentIDAt(model, req.Effort))
+		if to != provider.Anthropic && (req.ThinkOff || req.Effort == "" || offEffort(req.Effort)) && s.thinkingNeededMarked(p.ID, model, wireHint, to) {
+			if !s.thinkingNeededBothMarked(p.ID, model, wireHint, to) {
+				s.markThinkingNeeded(p, to, model, wireHint)
+			}
 			// a model whose upstream said thinking must be enabled: asked
 			// to reason at its least on Chat or Responses (Anthropic's
 			// body is given thinking once built, below)
@@ -8918,7 +9209,11 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			}
 			if n > 0 {
 				r := *req
-				r.MaxTokens, req = n, &r
+				r.MaxTokens = n
+				if to == provider.Anthropic && (r.OutputCap == 0 || n < r.OutputCap) {
+					r.OutputCap = n
+				}
+				req = &r
 				filledOutput = to != provider.Anthropic
 			}
 		}
@@ -8934,19 +9229,64 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			r := *req
 			r.System, sent = withoutBillingHeader(r.System), &r
 		}
+		if to == provider.Anthropic && wire != "" && wire != model {
+			// adaptive, budget and output_config decisions follow the
+			// upstream id. The model field is still rewritten below (#7389).
+			shaped := *sent
+			shaped.WireModel = wire
+			sent = &shaped
+		}
+		if to == provider.Anthropic && s.thinkingNeededMarked(p.ID, model, wire, to) {
+			if cap := attemptMaxOut(ctx, p, model); cap > 0 && cap <= neededBudget {
+				if st, ok := anthropicAttemptOf(ctx); ok && st.syntheticThinking {
+					// A cap at or under neededBudget cannot fit an "enabled"
+					// budget and this upstream refuses "adaptive"; omit the
+					// synthetic thinking and effort added by translatedFallback
+					// so neither leaks upstream or inflates max_tokens (#7389).
+					r := *sent
+					r.Thinking = false
+					r.Effort = ""
+					r.EffortOverride = false
+					sent = &r
+				}
+			}
+		}
 		body, err := buildFor(p, to, sent, model)
 		if err != nil {
 			return nil, to, err
 		}
-		noteWireEffort(ctx, to, sent)
-		if to == provider.Anthropic && !s.fits(p.ID, thinkingNeeded(model), to) {
+		if to == provider.Anthropic && s.thinkingNeededMarked(p.ID, model, wire, to) {
+			if !s.thinkingNeededBothMarked(p.ID, model, wire, to) {
+				// ensure both local alias and upstream wire name are marked so
+				// forwardOnce does not rewrite "enabled" back to "adaptive" (#7389)
+				s.markThinkingNeeded(p, to, model, wire)
+			}
 			// a model whose upstream said thinking must be enabled
 			// (thinkingNeededRefusal): a request built thinking off, or
-			// with none (a short one), goes thinking at the least budget
-			if nb, ok := withThinkingEnabled(body); ok {
+			// with none (a short one), goes thinking at the least budget.
+			// One already asked adaptive, which that upstream also
+			// refuses, goes as enabled at its level's budget.
+			if nb, ok := withThinkingEnabledCapped(body, attemptMaxOut(ctx, p, model)); ok {
+				body = nb
+			} else if nb, ok := withAdaptiveAsEnabledCapped(body, attemptMaxOut(ctx, p, model)); ok {
 				body = nb
 			}
 		}
+		wireReq := sent
+		if to == provider.Anthropic && !sent.ThinkOff && sent.Effort != "" {
+			if !hasThinking(body) && outputConfigEffort(body) == "" {
+				r := *sent
+				r.Effort = ""
+				wireReq = &r
+			} else if gjson.GetBytes(body, "thinking.type").String() == "enabled" && outputConfigEffort(body) == "" {
+				if b := int(gjson.GetBytes(body, "thinking.budget_tokens").Int()); b > 0 && b < budgetOf(sent.Effort) {
+					r := *sent
+					r.Effort = effortOfBudget(b)
+					wireReq = &r
+				}
+			}
+		}
+		noteWireEffort(ctx, to, wireReq)
 		if to == provider.Chat && (p.IsBedrock() || p.IsAzure()) {
 			body = asCompletionTokens(body)
 		}
@@ -8992,7 +9332,7 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		body = xaiBody(p, to, body)
 		// a Gemini 3 or later on an Anthropic or Chat relay is asked a
 		// thinking level, never a budget (gemini_level_body.go)
-		body = geminiLevelBody(p, to, model, body)
+		body = geminiLevelBody(p, to, model, cmp.Or(wire, model), body)
 		if to == provider.CodeAssist && p.Account != nil {
 			// the envelope is named in there, where the id it carries is
 			// known: on Antigravity that is the variant the effort picked,
@@ -9097,12 +9437,24 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			req = thinkingBackOn(p, model, req)
 			continue
 		}
-		if res.StatusCode == http.StatusBadRequest && thinkingNeededRefusal.Match(b) && s.fits(p.ID, thinkingNeeded(model), to) {
-			if _, off := withThinkingEnabled(body); to == provider.Anthropic && off || to != provider.Anthropic && (req.ThinkOff || req.Effort == "" || offEffort(req.Effort)) {
-				// sent no thinking, or thinking off, which the upstream
-				// takes the model only with (Claude Desktop's check, a
-				// title): asked again thinking at its least, and so from
-				// then on
+		if res.StatusCode == http.StatusBadRequest && thinkingNeededRefusal.Match(b) && !s.thinkingNeededBothMarked(p.ID, model, wire, to) {
+			if to == provider.Anthropic {
+				_, offUncapped := withThinkingEnabled(body)
+				_, adaptiveUncapped := withAdaptiveAsEnabled(body)
+				if offUncapped || adaptiveUncapped {
+					// sent no thinking, thinking off, or adaptive, which the
+					// upstream takes the model only with enabled: remember for
+					// future requests, and retry now only when attemptMaxOut
+					// leaves room for neededBudget (#7389).
+					s.markThinkingNeeded(p, to, model, wire)
+					maxOut := attemptMaxOut(ctx, p, model)
+					_, off := withThinkingEnabledCapped(body, maxOut)
+					_, adaptive := withAdaptiveAsEnabledCapped(body, maxOut)
+					if off || adaptive {
+						continue
+					}
+				}
+			} else if req.ThinkOff || req.Effort == "" || offEffort(req.Effort) {
 				s.markThinkingNeeded(p, to, model, wire)
 				continue
 			}
@@ -9885,6 +10237,16 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
+	if from == provider.Anthropic {
+		if st, ok := anthropicAttemptOf(r.Context()); ok {
+			request.EffortOverride = st.effortOverride
+			request.SyntheticThinking = st.syntheticThinking
+			request.SideReplyRoom = st.sideReplyRoom
+		}
+		if n := attemptMaxOut(r.Context(), p, model); n > 0 {
+			request.OutputCap = n
+		}
+	}
 	if request.WebSearch {
 		// an API on which the provider searches by itself comes first;
 		// without one, its model is given magpie's search. A searcher
@@ -10037,12 +10399,23 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 	// a failure after it, which rested the account (#3274). Nothing has
 	// reached the client yet, so it is told the refusal, as it would be
 	// with nothing said
-	if col.err != "" && !saidAnything(col.res.Parts) && thinkingNeededRefusal.MatchString(col.err) && s.fits(p.ID, thinkingNeeded(model), actual) {
+	streamWire := provider.UpstreamNameAsIn(wiresOf(r.Context()), p.ID, model, p.SentIDAt(model, request.Effort))
+	if col.err != "" && !saidAnything(col.res.Parts) && thinkingNeededRefusal.MatchString(col.err) && !s.thinkingNeededBothMarked(p.ID, model, streamWire, actual) {
 		// the refusal of a request sent no thinking, carried in the
 		// stream rather than as a 400 (forwardTranslated asks again for
-		// that one): remembered, and asked once more, thinking
-		s.markThinkingNeeded(p, actual, model, provider.UpstreamNameIn(wiresOf(r.Context()), p.ID, model))
-		return s.translate(w, r, p, from, to, model, body, u)
+		// that one): remembered, and asked once more when thinking can
+		// actually be enabled under the cap and tool_choice (#7389).
+		s.markThinkingNeeded(p, actual, model, streamWire)
+		canRetry := true
+		if actual == provider.Anthropic {
+			maxOut := attemptMaxOut(r.Context(), p, model)
+			if forcesTool(request.ToolChoice) || (maxOut > 0 && maxOut <= neededBudget) {
+				canRetry = false
+			}
+		}
+		if canRetry {
+			return s.translate(w, r, p, from, to, model, body, u)
+		}
 	}
 	if col.err != "" && (!saidAnything(col.res.Parts) || col.errSaid != nil) {
 		said := col.err
@@ -11387,13 +11760,21 @@ func bodyEffort(proto provider.Protocol, body []byte) string {
 func withBodyEffort(proto provider.Protocol, body []byte, effort string) []byte {
 	switch proto {
 	case provider.Anthropic:
+		// output_config is patched as raw JSON. Decoding it as
+		// map[string]any turns a schema integer past 2^53 into the
+		// nearest float (9007199254740993 became 9007199254740992)
+		// when the fitted level is written back (#7389).
 		var v struct {
-			OutputConfig map[string]any `json:"output_config"`
+			OutputConfig map[string]json.RawMessage `json:"output_config"`
 		}
 		if decodeJSON(body, &v) != nil || v.OutputConfig == nil {
 			return body
 		}
-		v.OutputConfig["effort"] = effort
+		raw, err := json.Marshal(effort)
+		if err != nil {
+			return body
+		}
+		v.OutputConfig["effort"] = raw
 		return withFields(body, map[string]any{"output_config": v.OutputConfig})
 	case provider.Chat:
 		return withFields(body, map[string]any{"reasoning_effort": effort})

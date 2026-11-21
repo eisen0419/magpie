@@ -535,6 +535,16 @@ func ThinksOnlyWhenAsked(model string) bool {
 	return anthropicModel.MatchString(model) || claudeVersion.MatchString(strings.ToLower(model))
 }
 
+// budgetClaudeEffort is a model asked by a thinking budget rather than
+// output_config.effort: a budget Claude, a custom relay id, or a
+// budget-based vendor. The name is the Claude it was first written for.
+// A rule's level on one of these is raised with replyRoom when the body
+// is built again (anthropicBody). A host that reads output_config
+// (outputEffortAt) still gets the field beside the budget.
+func budgetClaudeEffort(model string) bool {
+	return !anthropicLevelInOutput("", model)
+}
+
 // withoutThinkingOff is body with its thinking left to the model, when it
 // says thinking is off; false when it doesn't.
 func withoutThinkingOff(body []byte) ([]byte, bool) {
@@ -967,16 +977,20 @@ var glmOutputEffort = lazyre.New(`(?i)glm-5\.[23](?:$|[-.:/\[])`)
 func withOutputEffort(body []byte, levels []string) []byte {
 	e := requestEffort(provider.Anthropic, body)
 	var v struct {
-		OutputConfig map[string]any `json:"output_config"`
+		OutputConfig map[string]json.RawMessage `json:"output_config"`
 	}
 	if e == "" || decodeJSON(body, &v) != nil {
 		return body
 	}
 	oc := v.OutputConfig
 	if oc == nil {
-		oc = map[string]any{}
+		oc = map[string]json.RawMessage{}
 	}
-	oc["effort"] = fitEffort(e, levels)
+	rawEffort, err := json.Marshal(fitEffort(e, levels))
+	if err != nil {
+		return body
+	}
+	oc["effort"] = rawEffort
 	return withFields(body, map[string]any{"output_config": oc})
 }
 
@@ -1157,21 +1171,77 @@ func anthropicBody(r *Request, model, host string, replay bool) []byte {
 	// low budget: it was thinking at 4096 tokens while the log said none
 	// (#1636). A model that won't stop thinking is asked again as before
 	// (forwardTranslated); thinkingOffAsTaken fits off to each Claude
-	think := (r.Thinking || r.Effort != "") && !r.ThinkOff
+	think := (r.Thinking || r.Effort != "") && !r.ThinkOff && !(r.SyntheticThinking && forcesTool(r.ToolChoice))
 	if r.ThinkOff {
 		out["thinking"] = map[string]any{"type": "disabled"}
 	}
-	if think && adaptiveOnly(model) {
+	// a local alias is not a Claude and is not in output_config's list.
+	// The upstream id is what this body is sent as (#7389).
+	shape := model
+	if r.WireModel != "" {
+		shape = r.WireModel
+	}
+	thinkingEmitted := false
+	if think && adaptiveOnly(shape) {
 		// Opus 4.7 and later leave the thinking text out unless asked
 		// (display "omitted" by default), and a Chat or Responses client
 		// that asked to reason would see none of it; OpenAI is asked for
 		// its summary and the Claude subscription for summarized alike
 		out["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
+		thinkingEmitted = true
 		if e := r.Effort; e != "" {
-			if e == "xhigh" && noXhigh(model) {
+			if e == "xhigh" && noXhigh(shape) {
 				e = "max"
 			}
 			out["output_config"] = map[string]any{"effort": e}
+			if r.SideReplyRoom && r.MaxTokens > 0 {
+				if raised := replyRoom(r.MaxTokens, e); raised > maxTokens {
+					maxTokens = raised
+				}
+				if r.OutputCap > 0 && maxTokens > r.OutputCap {
+					maxTokens = r.OutputCap
+				}
+			}
+		}
+	} else if r.EffortOverride && think && r.Effort != "" {
+		// a rule, a fixed level, an effort map or WithSideEffort asked
+		// this, at the client's max_tokens. Raising that limit leaves the
+		// level's full budget, instead of dropping thinking under 2048 or
+		// cutting the budget down to a lower level. A budget Claude is
+		// asked the budget alone, unless the host reads output_config; any
+		// other model is asked the level there too, which is what
+		// withAnthropicFixedMode writes and what a later parse reads back.
+		// The member's Max output still bounds the raise.
+		budget := budgetOf(r.Effort)
+		if r.MaxTokens > 0 {
+			if r.SideReplyRoom || r.MaxTokens <= budget {
+				if raised := replyRoom(r.MaxTokens, effortOf(r.Effort)); raised > maxTokens {
+					maxTokens = raised
+				}
+			}
+		} else if maxTokens < budget+4096 {
+			maxTokens = budget + 4096
+		}
+		if r.OutputCap > 0 && maxTokens > r.OutputCap {
+			maxTokens = r.OutputCap
+		}
+		if maxTokens > 0 && budget >= maxTokens {
+			if maxTokens-1 >= neededBudget {
+				budget = maxTokens - 1
+			} else {
+				budget = 0
+			}
+		}
+		if budget >= neededBudget {
+			out["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+			thinkingEmitted = true
+			// a budget model is asked by the budget alone. A model that
+			// reads output_config.effort, and a host that reads it, is
+			// asked the level there too (withAnthropicFixedMode). A
+			// budget-only vendor is not given a field it was not sent.
+			if !budgetClaudeEffort(shape) || outputEffortAt(host, shape) {
+				out["output_config"] = map[string]any{"effort": r.Effort}
+			}
 		}
 	} else if budget := budgetOf(r.Effort); think && (r.MaxTokens <= 0 || r.MaxTokens > 2048) {
 		if r.MaxTokens > 0 {
@@ -1184,13 +1254,17 @@ func anthropicBody(r *Request, model, host string, replay bool) []byte {
 			maxTokens = budget + 4096
 		}
 		out["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
-		if r.Effort != "" && outputEffortAt(host, model) {
+		thinkingEmitted = true
+		if r.Effort != "" && outputEffortAt(host, shape) {
 			out["output_config"] = map[string]any{"effort": r.Effort}
 		}
-	} else if r.Temp != nil {
-		out["temperature"] = *r.Temp
-	} else if r.TopP != nil {
-		out["top_p"] = *r.TopP
+	}
+	if !thinkingEmitted {
+		if r.Temp != nil {
+			out["temperature"] = *r.Temp
+		} else if r.TopP != nil {
+			out["top_p"] = *r.TopP
+		}
 	}
 	if s := r.Format.schema(); len(s) > 0 {
 		oc, _ := out["output_config"].(map[string]any)

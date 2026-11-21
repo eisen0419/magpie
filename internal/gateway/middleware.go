@@ -145,6 +145,7 @@ func accountSkipped(ctx context.Context, p provider.Provider, model string) (by 
 // is it the agent's turn, which a model set for requests masking would
 // change takes (maskRouteFor): it is masked as magpie's own asks are.
 func ownAsk(ctx context.Context) context.Context {
+	ctx = withAnthropicAttempt(ctx, anthropicAttemptState{})
 	return context.WithValue(context.WithValue(ctx, triedKey{}, mwRuns{}), agentTurnKey{}, false)
 }
 

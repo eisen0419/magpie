@@ -31,16 +31,29 @@ import (
 // one for Gemini's own OpenAI-compatible API (geminiCompat), which takes
 // a budget and whose levels the Chat path fits, and asks again when one
 // is turned away (geminiRefusedLevel).
-func geminiLevelBody(p provider.Provider, proto provider.Protocol, model string, body []byte) []byte {
+func geminiLevelBody(p provider.Provider, proto provider.Protocol, listed, model string, body []byte) []byte {
 	if proto != provider.Anthropic && proto != provider.Chat {
 		return body
+	}
+	if listed == "" {
+		listed = model
+	}
+	if model == "" {
+		model = listed
 	}
 	if proto == provider.Chat && geminiCompat(p.VendorHost(), model) {
 		return body
 	}
 	m := strings.ToLower(model)
+	effortsModel := model
 	if geminiGeneration(m) < 3 {
-		return body
+		l := strings.ToLower(listed)
+		if geminiGeneration(l) >= 3 && (model == listed || (len(catalog.EffortsOf(model)) == 0 && !strings.Contains(m, "claude"))) {
+			m = l
+			effortsModel = listed
+		} else {
+			return body
+		}
 	}
 	if !bodyHas(body, `"thinking`) && !bodyHas(body, `"reasoning_effort"`) && !bodyHas(body, `"output_config"`) {
 		return body
@@ -52,7 +65,10 @@ func geminiLevelBody(p provider.Provider, proto provider.Protocol, model string,
 		return body
 	}
 	fields := map[string]any{}
-	efforts := p.Efforts(model)
+	efforts := p.Efforts(effortsModel)
+	if len(efforts) == 0 && listed != effortsModel {
+		efforts = p.Efforts(listed)
+	}
 	switch proto {
 	case provider.Anthropic:
 		th, _ := top["thinking"].(map[string]any)

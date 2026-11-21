@@ -1255,3 +1255,79 @@ func TestUpstreamNamesAreReadOnceInATurn(t *testing.T) {
 		t.Errorf("the relay answered with the name the turn went out under, which is no swap: %+v", route)
 	}
 }
+
+// A turn's effort shape and the model passthrough writes are one snapshot.
+// effortShapeModel used to call provider.UpstreamName, which reads
+// settings.Load, while passthrough rewrites "model" from wiresOf. A
+// settings.Save between those two reads asked one shape and sent another
+// name (#7389).
+func TestEffortShapeSharesTheTurnsWireSnapshot(t *testing.T) {
+	fresh(t)
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k",
+		Models: []string{"review-sonnet"}, Anthropic: "http://127.0.0.1:1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SetUpstreamName("relay/review-sonnet", "claude-sonnet-4-5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SetModelEfforts("relay/review-sonnet", []string{"low", "medium", "high"}); err != nil {
+		t.Fatal(err)
+	}
+	p, model, ok := provider.Resolve("relay/review-sonnet")
+	if !ok {
+		t.Fatal("resolve")
+	}
+	req := withWires(httptest.NewRequest("POST", "/v1/messages", nil))
+	if got := wiresOf(req.Context())["relay/review-sonnet"]; got != "claude-sonnet-4-5" {
+		t.Fatalf("snapshot %q, want the name in force when the turn began", got)
+	}
+	st := settings.Load()
+	st.ModelWires = map[string]string{"relay/review-sonnet": "claude-opus-5-5"}
+	if err := settings.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	wires := wiresOf(req.Context())
+	shape := effortShapeModelAt(wires, p, model)
+	sent := provider.UpstreamNameAsIn(wires, p.ID, model, p.SentIDAt(model, ""))
+	if shape != "claude-sonnet-4-5" || sent != shape {
+		t.Fatalf("effort shape %q, model rewrite %q; both want the turn's claude-sonnet-4-5", shape, sent)
+	}
+	if live := provider.UpstreamName(p, model); live != "claude-opus-5-5" {
+		t.Fatalf("live upstream name %q, want the mid-turn save", live)
+	}
+	body := []byte(`{"model":"review-sonnet","max_tokens":8192,"messages":[{"role":"user","content":"hi"}]}`)
+	asked := rewriteModel(withAnthropicFixedMode(body, "", shape, "high", false, false, false, false), sent)
+	var got struct {
+		Model    string `json:"model"`
+		Thinking struct {
+			Type   string `json:"type"`
+			Budget int    `json:"budget_tokens"`
+		} `json:"thinking"`
+		OutputConfig struct {
+			Effort string `json:"effort"`
+		} `json:"output_config"`
+	}
+	if err := json.Unmarshal(asked, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "claude-sonnet-4-5" || got.Thinking.Type != "enabled" || got.Thinking.Budget != budgetOf("high") || got.OutputConfig.Effort != "" {
+		t.Fatalf("snapshot body %+v, want budget Claude claude-sonnet-4-5", got)
+	}
+	// the name a fresh Load sees is an adaptive Claude, which the same
+	// level would ask in output_config.effort. The turn must not.
+	live := withAnthropicFixedMode(body, "", provider.UpstreamName(p, model), "high", false, false, false, false)
+	var other struct {
+		Thinking struct {
+			Type string `json:"type"`
+		} `json:"thinking"`
+		OutputConfig struct {
+			Effort string `json:"effort"`
+		} `json:"output_config"`
+	}
+	if err := json.Unmarshal(live, &other); err != nil {
+		t.Fatal(err)
+	}
+	if other.Thinking.Type != "adaptive" || other.OutputConfig.Effort != "high" {
+		t.Fatalf("live name body thinking %q effort %q, want adaptive high", other.Thinking.Type, other.OutputConfig.Effort)
+	}
+}
