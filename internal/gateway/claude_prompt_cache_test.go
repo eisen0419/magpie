@@ -10,10 +10,10 @@ import (
 	"testing"
 )
 
-// The caller's instructions are a block of their own, marked for an hour's
-// cache, ahead of the messages: two requests with the same instructions
-// and different messages share them in the cache. Claude Code writes an
-// hour's cache too, as a 1h mark may not follow a 5m one.
+// The caller's instructions stay in a block of their own ahead of the
+// messages, without a magpie cache_control mark on the default path
+// (clientCache == nil): Claude Code's own prompt caching stays on and may
+// use all four of Anthropic's slots from a run's second request on (#7420).
 func TestClaudeInstructionsCachedApart(t *testing.T) {
 	for _, said := range []string{"one", "two"} {
 		blocks, err := renderClaudePrompt(&Request{System: "rules", Messages: []Message{{Role: "user", Parts: []Part{{Kind: Text, Text: said}}}}})
@@ -23,8 +23,8 @@ func TestClaudeInstructionsCachedApart(t *testing.T) {
 		if len(blocks) != 2 || blocks[0]["text"] != "<external_system_instructions>\nrules\n</external_system_instructions>\n\n" {
 			t.Fatalf("blocks: %v", blocks)
 		}
-		if cc, _ := blocks[0]["cache_control"].(map[string]string); cc["ttl"] != "1h" || blocks[1]["cache_control"] != nil {
-			t.Fatalf("cache marks: %v", blocks)
+		if blocks[0]["cache_control"] != nil || blocks[1]["cache_control"] != nil {
+			t.Fatalf("default path must not emit cache_control marks: %v", blocks)
 		}
 		if !strings.Contains(blocks[1]["text"].(string), "Human: "+said) {
 			t.Fatalf("messages: %v", blocks[1])
@@ -44,11 +44,12 @@ func TestClaudeInstructionsCachedApart(t *testing.T) {
 
 // A bridge run keeps its prompt cache as long as the user picked for
 // Claude Code's main conversation, in the Agents page (settings.json's
-// promptCacheTtl) or a variable, and the marks magpie puts in its first
-// message are as long, since Anthropic refuses a 1h mark after a 5m one.
-// With nothing picked it is an hour, as before. linkaww: 5m picked, the
-// run was given CLAUDE_CODE_PROMPT_CACHE_TTL=1h, and 237 of 241 relayed
-// requests wrote an hour's cache.
+// promptCacheTtl) or a variable. With nothing picked it is an hour, as
+// before. linkaww: 5m picked, the run was given
+// CLAUDE_CODE_PROMPT_CACHE_TTL=1h, and 237 of 241 relayed requests wrote
+// an hour's cache. On the default path (clientCache == nil), the first
+// message carries no magpie cache_control mark so Claude Code's own four
+// marks never become five (#7420).
 func TestClaudeRunKeepsTheUsersCacheTTL(t *testing.T) {
 	for _, c := range []struct {
 		name, settings, env, force, marks, want string
@@ -123,9 +124,11 @@ func TestClaudeRunKeepsTheUsersCacheTTL(t *testing.T) {
 						break
 					}
 				}
-				other := map[string]string{"5m": "1h", "1h": "5m"}[c.want]
-				if !strings.Contains(told, `"ttl":"`+c.want+`"`) || strings.Contains(told, `"ttl":"`+other+`"`) {
-					t.Fatalf("first message's marks, want %s: %s", c.want, told)
+				if told == "" {
+					t.Fatalf("run log missing told line:\n%s", log)
+				}
+				if strings.Contains(told, `"cache_control"`) {
+					t.Fatalf("default path first message must not carry cache_control: %s", told)
 				}
 			}
 		})
@@ -184,15 +187,19 @@ func TestClaudeInstructionsWithoutBillingHeader(t *testing.T) {
 	}
 }
 
-// A run started anew for a conversation with history marks the history's
-// last whole chunk, not the instructions, and a later run told more of the
-// same conversation repeats every block up to that mark: Anthropic finds
-// what the first wrote 20 blocks back from the second's mark. Before, the
-// history went in one block with the turn to answer, and each run started
-// anew wrote all of it again (a change of tools, a turn that missed its run).
+// A run started anew for a conversation with history chunks the history
+// stably so a later run repeats the same prefix blocks before
+// <current_turn>. On the default path (clientCache == nil), magpie leaves
+// the first message unmarked so Claude Code's own four marks never become
+// five (#7420). With client marks (clientCache != nil, where -p sets
+// DISABLE_PROMPT_CACHING=1 and a slot is free), magpie still marks the
+// history's last whole chunk within Anthropic's 20-block lookback.
 func TestClaudeHistoryCachedAcrossNewRuns(t *testing.T) {
-	conversation := func(replies int) *Request {
+	conversation := func(replies int, withClientCache bool) *Request {
 		req := &Request{System: "rules", Tools: []Tool{{Name: "read"}}}
+		if withClientCache {
+			req.clientCache = &clientCache{}
+		}
 		for i := 0; i < replies; i++ {
 			req.Messages = append(req.Messages,
 				Message{Role: "user", Parts: []Part{{Kind: Text, Text: fmt.Sprintf("question %d", i)}}},
@@ -215,11 +222,26 @@ func TestClaudeHistoryCachedAcrossNewRuns(t *testing.T) {
 		}
 		return at
 	}
-	earlier, err := renderClaudePrompt(conversation(10))
+
+	// Default path: stable chunk boundaries, zero magpie marks.
+	defEarlier := mustRender(t, conversation(10, false))
+	defLater := mustRender(t, conversation(25, false))
+	if at := marked(defEarlier); len(at) != 0 {
+		t.Fatalf("default earlier marks = %v, want none", at)
+	}
+	if at := marked(defLater); len(at) != 0 {
+		t.Fatalf("default later marks = %v, want none", at)
+	}
+	if at := marked(mustRender(t, conversation(1, false))); len(at) != 0 {
+		t.Fatalf("default short marks = %v, want none", at)
+	}
+
+	// Explicit client-cache path: last whole history chunk stays marked when a slot is free.
+	earlier, err := renderClaudePrompt(conversation(10, true))
 	if err != nil {
 		t.Fatal(err)
 	}
-	later, err := renderClaudePrompt(conversation(25))
+	later, err := renderClaudePrompt(conversation(25, true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,25 +257,32 @@ func TestClaudeHistoryCachedAcrossNewRuns(t *testing.T) {
 		if a != b {
 			t.Fatalf("block %d differs:\n%q\n%q", i, a, b)
 		}
+		if defEarlier[i]["text"] != defLater[i]["text"] {
+			t.Fatalf("default block %d differs:\n%q\n%q", i, defEarlier[i]["text"], defLater[i]["text"])
+		}
 	}
 	if strings.Contains(earlier[first[0]]["text"].(string), "the turn to answer") {
 		t.Fatalf("the marked block holds the turn to answer")
 	}
-	// a conversation with less than a chunk of history keeps the mark on the instructions
-	short, _ := renderClaudePrompt(conversation(1))
-	if at := marked(short); len(at) != 1 || at[0] != 0 {
-		t.Fatalf("short conversation marks %v", at)
+	// a conversation with less than a chunk of history gets no chunk mark
+	short, _ := renderClaudePrompt(conversation(1, true))
+	if at := marked(short); len(at) != 0 {
+		t.Fatalf("short conversation marks %v, want none", at)
 	}
 }
 
 // A conversation with no reply that calls no tool, as a sub-agent's loop
 // of tool calls that Claude Code's AgentSummary asks a summary of with its
-// last results, has no history to chunk: its messages before the last are
-// chunked, so a later request of the same loop, started anew, reads what
-// the earlier one wrote (#1716, JinJieBeWater).
+// last results, chunks its messages before the last (#1716, JinJieBeWater).
+// On the default path (clientCache == nil), those chunks carry no magpie
+// cache_control mark (#7420); with client marks (clientCache != nil) and a free slot,
+// the last whole chunk is still marked and excludes the last message.
 func TestClaudeToolLoopCachedAcrossNewRuns(t *testing.T) {
-	loop := func(rounds int, ask string) *Request {
+	loop := func(rounds int, ask string, withClientCache bool) *Request {
 		req := &Request{System: "rules", Tools: []Tool{{Name: "read"}}}
+		if withClientCache {
+			req.clientCache = &clientCache{}
+		}
 		req.Messages = append(req.Messages, Message{Role: "user", Parts: []Part{{Kind: Text, Text: "the task"}}})
 		for i := 0; i < rounds; i++ {
 			last := []Part{{Kind: ToolResult, CallID: fmt.Sprintf("c%d", i), Text: "contents"}}
@@ -275,15 +304,30 @@ func TestClaudeToolLoopCachedAcrossNewRuns(t *testing.T) {
 		}
 		return at
 	}
-	earlier, err := renderClaudePrompt(loop(20, "summarize so far"))
+
+	// Default path: stable chunks, zero magpie marks.
+	defEarlier := mustRender(t, loop(20, "summarize so far", false))
+	defLater := mustRender(t, loop(24, "summarize again", false))
+	if at := marked(defEarlier); len(at) != 0 {
+		t.Fatalf("default earlier loop marks = %v, want none", at)
+	}
+	if at := marked(defLater); len(at) != 0 {
+		t.Fatalf("default later loop marks = %v, want none", at)
+	}
+	if at := marked(mustRender(t, loop(3, "x", false))); len(at) != 0 {
+		t.Fatalf("default short loop marks = %v, want none", at)
+	}
+
+	// Explicit client-cache path: last whole chunk marked when a slot is free.
+	earlier, err := renderClaudePrompt(loop(20, "summarize so far", true))
 	if err != nil {
 		t.Fatal(err)
 	}
-	later, err := renderClaudePrompt(loop(24, "summarize again"))
+	later, err := renderClaudePrompt(loop(24, "summarize again", true))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if historyEnd(loop(20, "x").Messages) != 0 {
+	if historyEnd(loop(20, "x", true).Messages) != 0 {
 		t.Fatal("the loop has a history")
 	}
 	first, second := marked(earlier), marked(later)
@@ -294,12 +338,15 @@ func TestClaudeToolLoopCachedAcrossNewRuns(t *testing.T) {
 		if earlier[i]["text"] != later[i]["text"] {
 			t.Fatalf("block %d differs:\n%q\n%q", i, earlier[i]["text"], later[i]["text"])
 		}
+		if defEarlier[i]["text"] != defLater[i]["text"] {
+			t.Fatalf("default block %d differs:\n%q\n%q", i, defEarlier[i]["text"], defLater[i]["text"])
+		}
 	}
 	if strings.Contains(earlier[first[0]]["text"].(string), "summarize") {
 		t.Fatalf("the marked block holds the last message")
 	}
 	// the last message is never in a chunk, when it would end one either
-	even := loop(15, "summarize at the end of a chunk")
+	even := loop(15, "summarize at the end of a chunk", true)
 	even.Messages = append([]Message{{Role: "user", Parts: []Part{{Kind: Text, Text: "context"}}}}, even.Messages...)
 	if len(even.Messages)%historyChunk != 0 {
 		t.Fatalf("%d messages", len(even.Messages))
@@ -308,9 +355,105 @@ func TestClaudeToolLoopCachedAcrossNewRuns(t *testing.T) {
 	if at := marked(blocks); len(at) != 1 || strings.Contains(blocks[at[0]]["text"].(string), "summarize") {
 		t.Fatalf("marks %v in %v", at, blocks)
 	}
-	// a loop shorter than a chunk keeps the mark on the instructions
-	if at := marked(mustRender(t, loop(3, "x"))); len(at) != 1 || at[0] != 0 {
-		t.Fatalf("short loop marks %v", at)
+	// a loop shorter than a chunk gets no chunk mark
+	if at := marked(mustRender(t, loop(3, "x", true))); len(at) != 0 {
+		t.Fatalf("short loop marks %v, want none", at)
+	}
+}
+
+// Claude Code 2.1.330 puts four cache_control marks of its own on a run
+// from its second request on (two on the system prompt, two on the last
+// messages). On the default path (no X-Magpie-Cache-Marks: client),
+// Claude Code's own prompt caching stays on, so any mark magpie writes
+// into the first message makes five and Anthropic refuses every later
+// request of the run with 400 (#7420).
+func TestClaudePrintDefaultPathStaysWithinFourCacheMarks(t *testing.T) {
+	const claudeCodeSecondRequestMarks = 4
+	countMarks := func(blocks []map[string]any) int {
+		n := 0
+		for _, b := range blocks {
+			if _, ok := b["cache_control"]; ok {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Long conversation (> historyChunk = 16 messages) with instructions.
+	longReq := &Request{System: "rules", Tools: []Tool{{Name: "read"}}}
+	for i := 0; i < 5; i++ {
+		longReq.Messages = append(longReq.Messages,
+			Message{Role: "user", Parts: []Part{{Kind: Text, Text: fmt.Sprintf("q%d", i)}}},
+			Message{Role: "assistant", Parts: []Part{{Kind: Text, Text: fmt.Sprintf("a%d", i)}, {Kind: ToolCall, ID: fmt.Sprintf("c%d", i), Name: "read", Args: json.RawMessage(`{"path":"a"}`)}}},
+			Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: fmt.Sprintf("c%d", i), Text: "ok"}}},
+			Message{Role: "assistant", Parts: []Part{{Kind: Text, Text: fmt.Sprintf("done%d", i)}}})
+	}
+	longReq.Messages = append(longReq.Messages, Message{Role: "user", Parts: []Part{{Kind: Text, Text: "next"}}})
+
+	// Short conversation (< historyChunk) with instructions.
+	shortReq := &Request{
+		System:   "rules",
+		Messages: []Message{{Role: "user", Parts: []Part{{Kind: Text, Text: "hi"}}}},
+	}
+
+	// Tool loop (> historyChunk) with no plain assistant reply.
+	loopReq := &Request{System: "rules", Tools: []Tool{{Name: "read"}}}
+	loopReq.Messages = append(loopReq.Messages, Message{Role: "user", Parts: []Part{{Kind: Text, Text: "task"}}})
+	for i := 0; i < 10; i++ {
+		loopReq.Messages = append(loopReq.Messages,
+			Message{Role: "assistant", Parts: []Part{{Kind: ToolCall, ID: fmt.Sprintf("t%d", i), Name: "read", Args: json.RawMessage(`{"path":"a"}`)}}},
+			Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: fmt.Sprintf("t%d", i), Text: "ok"}}})
+	}
+
+	for _, tc := range []struct {
+		name string
+		req  *Request
+	}{
+		{"long history", longReq},
+		{"short instructions", shortReq},
+		{"long tool loop", loopReq},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			blocks := mustRender(t, tc.req)
+			got := countMarks(blocks)
+			if total := got + claudeCodeSecondRequestMarks; total > 4 {
+				t.Fatalf("first message carries %d cache_control marks; with Claude Code's %d marks from the second request on, total = %d > 4", got, claudeCodeSecondRequestMarks, total)
+			}
+		})
+	}
+
+	// End-to-end fresh -p run without X-Magpie-Cache-Marks: client must keep
+	// Claude Code's caching on and emit zero cache_control marks in messages[0].
+	h := newScriptHarness(t, "ok", `echo "cache-disabled ${DISABLE_PROMPT_CACHING-unset}" >> $log`)
+	var rawMsgs []string
+	for i := 0; i < 9; i++ {
+		rawMsgs = append(rawMsgs,
+			fmt.Sprintf(`{"role":"user","content":"turn %d"}`, i),
+			fmt.Sprintf(`{"role":"assistant","content":"reply %d"}`, i))
+	}
+	rawMsgs = append(rawMsgs, `{"role":"user","content":"latest"}`)
+	body := `{"model":"claude-sonnet-5","max_tokens":64,"system":"rules","messages":[` + strings.Join(rawMsgs, ",") + `]}`
+	h.post(body)
+	runs := h.runs()
+	if len(runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(runs))
+	}
+	for _, log := range runs {
+		if !strings.Contains(log, "cache-disabled unset") {
+			t.Fatalf("default -p run disabled Claude Code caching:\n%s", log)
+		}
+		sawTold := false
+		for _, line := range strings.Split(log, "\n") {
+			if strings.HasPrefix(line, "told ") {
+				sawTold = true
+				if strings.Contains(line, `"cache_control"`) {
+					t.Fatalf("default -p run first message carries a cache_control mark:\n%s", line)
+				}
+			}
+		}
+		if !sawTold {
+			t.Fatalf("run log missing told line:\n%s", log)
+		}
 	}
 }
 

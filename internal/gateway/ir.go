@@ -186,8 +186,7 @@ type Request struct {
 	// translated to an Anthropic upstream (parseTranslated, #4571).
 	clientCache *clientCache
 	// cacheTTL is how long a Claude bridge run started for the request
-	// keeps its prompt cache (claudeRunTTL), which the marks magpie adds
-	// follow (runMark); "" is an hour
+	// keeps its prompt cache (claudeRunTTL); "" is an hour
 	cacheTTL string
 	// askedTTL is the longest TTL the request's own cache marks ask for
 	// (askedCacheTTL), "" for one that marks nothing or came in another API

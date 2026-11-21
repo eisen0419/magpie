@@ -1221,9 +1221,9 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 		log.Printf("claude: a new Claude Code is told the whole conversation: %d messages, %d images, the last turn marked as the one to answer", len(req.Messages), countImages(req.Messages))
 	}
 	if req.appendPrompt {
-		// pasted, the caller's instructions lose their cache mark (the
-		// paste is one text), and every new run wrote them to the cache
-		// anew: Claude Code's auto mode classifier, 80k tokens an ask with
+		// pasted in the first message, the caller's instructions carry no
+		// cache mark (the paste is one text), so every new run wrote them to
+		// the cache anew: Claude Code's auto mode classifier, 80k tokens an ask with
 		// 1,197 read (#2432), and a conversation's turn after a one-off
 		// first one, or after a client changed a reply, 7,290 written and
 		// 1,273 read of 8,565 (m4rs0n on Discord). After Claude Code's
@@ -4177,10 +4177,8 @@ func cleanClaudeEnvTTL(env []string, ttl string) []string {
 		// model that itself, and a status changing with each commit undoes
 		// the cache from there on
 		"CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1",
-		// the cache kept as the user picked (claudeRunTTL), stated so that
-		// the marks magpie puts in the first message (renderClaudePrompt,
-		// Request.cacheTTL) are the same: Anthropic refuses a 1h mark after
-		// a 5m one
+		// the cache kept as the user picked (claudeRunTTL), stated for Claude
+		// Code's own prompt caching
 		"CLAUDE_CODE_PROMPT_CACHE_TTL="+ttl)
 }
 
@@ -5289,21 +5287,14 @@ func renderClaudePromptAt(req *Request, split int) ([]map[string]any, error) {
 		text.WriteString(envNote(req))
 		text.WriteString(toolChoiceAsk(req))
 		text.WriteString("\n</external_system_instructions>\n\n")
-		// The caller's instructions are a block of their own, marked for the
-		// cache: Claude Code marks only the end of the message, so with them
-		// in one block with the conversation a request whose messages differ
-		// (the next item of a batch, a new conversation under the same
-		// instructions) found nothing cached past Claude Code's own prompt.
-		// The mark's TTL is the one Claude Code uses (runMark): Anthropic
-		// refuses a 1h mark after a 5m one.
-		block := map[string]any{"type": "text", "text": text.String()}
-		if req.clientCache == nil {
-			block["cache_control"] = req.runMark()
-		}
-		blocks = append(blocks, block)
+		// The caller's instructions stay in a block of their own ahead of the
+		// conversation. When clientCache == nil, Claude Code's own prompt
+		// caching stays on and may use all four of Anthropic's cache_control
+		// slots from a run's second request on, so magpie adds no mark here
+		// (#7420).
+		blocks = append(blocks, map[string]any{"type": "text", "text": text.String()})
 		text.Reset()
 	}
-	instructions := len(blocks) - 1
 	chunk := -1
 	offered := offeredTools(req.Tools)
 	// A conversation with replies in it is told in two parts: the turns
@@ -5355,14 +5346,14 @@ func renderClaudePromptAt(req *Request, split int) ([]map[string]any, error) {
 	case split > 0:
 		text.WriteString("</current_turn>")
 	}
-	// The one mark a run's first message may have (Claude Code keeps three
-	// of Anthropic's four) moves from the instructions to the history's
-	// last whole chunk, which holds them too: a later run started anew for
-	// the same conversation, as after a change of tools or a turn that
-	// missed its run, reads the history this one wrote, found within
-	// Anthropic's 20-block lookback, instead of writing all of it again.
-	// The turn to answer is never chunked when there is a history: a later
-	// run whose history ends further on tells those messages in it.
+	// With client marks (req.clientCache != nil: X-Magpie-Cache-Marks: client
+	// or classifierClientCache, where -p sets DISABLE_PROMPT_CACHING=1 so
+	// Claude Code adds no marks of its own), put a bridge mark on the
+	// history's last whole chunk whenever a slot is free, so a later run
+	// started anew for the same conversation can read it within Anthropic's
+	// 20-block lookback. On the default path (clientCache == nil), Claude
+	// Code's own caching stays on and uses all four slots from the second
+	// request on, so magpie leaves the first message unmarked (#7420).
 	if c := req.clientCache; c != nil {
 		c.fresh = true
 		if chunk >= 0 && c.count < 4 && blocks[chunk]["cache_control"] == nil {
@@ -5374,11 +5365,6 @@ func renderClaudePromptAt(req *Request, split int) ([]map[string]any, error) {
 			}
 			blocks[chunk]["cache_control"] = cacheMark(ttl)
 		}
-	} else if chunk >= 0 {
-		if instructions >= 0 {
-			delete(blocks[instructions], "cache_control")
-		}
-		blocks[chunk]["cache_control"] = req.runMark()
 	}
 	return closeBlocks(blocks, &text), nil
 }
@@ -5454,14 +5440,13 @@ func toolChoiceAsk(req *Request) string {
 // appendsPrompt: a new run for req gives the caller's instructions after
 // Claude Code's own system prompt (--append-system-prompt-file), not in
 // its first message. Every run in the interactive mode, which pastes its
-// first message as one text, without the mark renderClaudePrompt puts on
-// the instructions' block: there, a run started anew for the same
+// first message as one text: there, a run started anew for the same
 // instructions (the next one-off ask, a conversation's turn after a
 // one-off first one, a turn whose run was lost) read nothing past Claude
 // Code's own prompt. A run resuming a session is given them as the
 // session's run was (savedSession.appended). A lean run has them as its
 // system prompt already, a client's own marks keep theirs, and -p keeps
-// the mark.
+// the instructions in the first message.
 func appendsPrompt(req *Request, binary claudeCLI) bool {
 	return !req.leanPrompt && req.clientCache == nil &&
 		withoutBillingHeader(req.System)+envNote(req)+toolChoiceAsk(req) != "" && claudePrintWhy(req, binary) == ""
@@ -5486,16 +5471,6 @@ const historyChunk = 16
 // cacheMark1h is an hour's prompt-cache mark.
 func cacheMark1h() map[string]string {
 	return map[string]string{"type": "ephemeral", "ttl": "1h"}
-}
-
-// runMark is the prompt-cache mark on what magpie gives a run: kept as
-// long as Claude Code's own (Request.cacheTTL, given to the run by
-// cleanClaudeEnvTTL), since Anthropic refuses a 1h mark after a 5m one.
-func (r *Request) runMark() map[string]string {
-	if r.cacheTTL == "5m" {
-		return cacheMark("5m")
-	}
-	return cacheMark1h()
 }
 
 // historyOpen and historyClose wrap the turns a run started anew is told

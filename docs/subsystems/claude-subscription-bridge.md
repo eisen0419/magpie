@@ -1020,15 +1020,19 @@ own network waits (about 30s) before it draws.
 A run started anew is told the whole conversation in one user message
 (`renderClaudePrompt`), a prefix the prompt cache has never seen, so the
 conversation is written to the cache again and its images are sent again.
-By default, that message holds the history in blocks of `historyChunk`
-messages, and magpie's one mark (Claude Code keeps three of Anthropic's four) is on the
-last whole block, else on the caller's instructions: a later run started
-anew for the same conversation while it is cached reads the history up to an
-earlier run's mark, found within Anthropic's 20-block lookback. A
+That message holds the history in blocks of `historyChunk` messages, and a
 conversation with no history (no reply that calls no tool, as a sub-agent's
 loop of tool calls that Claude Code's AgentSummary asks a summary of) has
-its every message but the last chunked instead. The turn to answer after a
-history is not chunked, and image blocks count toward the lookback.
+its every message but the last chunked instead; the turn to answer after a
+history is not chunked, and image blocks count toward Anthropic's 20-block
+lookback. On the default path (`clientCache == nil`), Claude Code's own
+prompt caching stays on and uses all four of Anthropic's `cache_control`
+slots from a run's second request on (two on its system prompt, two on its
+last messages), so magpie places no `cache_control` mark in that first
+message (#7420); a `-p` run with client marks (`clientCache != nil`:
+`X-Magpie-Cache-Marks: client` or `classifierClientCache`) disables Claude
+Code's own caching (`DISABLE_PROMPT_CACHING=1`) and still marks the last
+whole chunk whenever a slot is free.
 A turn that goes on in the run that had the last one is told only the
 messages since (`renderClaudeTurn`), and Anthropic reads the rest from the
 cache.
@@ -1040,9 +1044,7 @@ main conversation (`claudeRunTTL`): `FORCE_PROMPT_CACHING_5M`, then
 cache · main conversation"), and an hour with none of them, as Claude Code
 writes it on a subscription within its limits. The run is given it as
 `CLAUDE_CODE_PROMPT_CACHE_TTL` (`cleanClaudeEnvTTL`; a saved account's
-Claude Code reads its own folder's settings, not the user's), and magpie's
-mark in the first message is as long (`Request.runMark`), since Anthropic
-refuses a 1h mark after a 5m one. A session a run goes on from keeps the
+Claude Code reads its own folder's settings, not the user's). A session a run goes on from keeps the
 lifetime it started with (`cachePrefix.ttl`; one saved before it was kept
 is an hour's). Until 11-07 every run was given 1h whatever the pick
 (linkaww). `TestClaudeRunKeepsTheUsersCacheTTL`. Every `savedSession`
@@ -1199,8 +1201,8 @@ Every run in the interactive mode (not lean, no client marks:
 `--append-system-prompt-file` instead (`append.md`, the same `leanSystem`
 text), after Claude Code's own prompt, and its first message holds the
 conversation alone. The helper pastes a first message as one text without
-marks, so instructions pasted there lost the mark `renderClaudePrompt` puts
-on their block, and every run started anew wrote them to the cache again:
+marks, so instructions pasted there had no cache mark of their own,
+and every run started anew wrote them to the cache again:
 Claude Code's auto mode classifier read 1,197 tokens and wrote 80k on every
 check of one conversation (#2432), and a conversation whose first request
 was a one-off ask (no tools, no reply; its run let go after the reply,
@@ -1215,7 +1217,7 @@ replayed transcript, `replaySession`, which then leaves them out of its
 user line) is given the file again when the session's run had it
 (`savedSession.appended`). The system prompt is part of every run key, so
 the file is the one the session's run had. `-p` keeps the instructions in
-the first message, where its mark holds. Tested by
+the first message. Tested by
 `TestClaudeTUIOneOffAskAppendsInstructions`,
 `TestClaudeAppendInTheInteractiveMode`,
 `TestClaudeTUIConversationKeepsItsInstructionsWhereTheFirstAskHadThem` and
