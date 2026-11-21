@@ -18,11 +18,14 @@ import (
 // has, and refuses -p while config.toml holds the legacy [profiles.<name>]
 // or profile = "<name>" (tried with codex-cli 0.165.0). So magpie writes
 // magpie.config.toml alone: model_provider, model, effort, the catalog and
-// its own [model_providers.magpie]. config.toml, its top-level
-// model_provider, model and openai_base_url are never touched. Disconnect
-// deletes that file and magpie's catalog. It is chosen by the Codex agent's
-// "applies to" field, which changes only while Codex is not connected, so
-// the two wirings never meet in one config.
+// its own [model_providers.magpie]. Connecting, syncing and disconnecting
+// never touch config.toml or its top-level model_provider, model and
+// openai_base_url. Disconnect deletes that file and magpie's catalog.
+// Uninstall's TakeCodexLeftovers still removes a leftover profile whose
+// model_provider is magpie, even when the model no longer resolves, and
+// any magpie base URL or provider left in config.toml (#7452). It is
+// chosen by the Codex agent's "applies to" field, which changes only
+// while Codex is not connected, so a connect writes one wiring.
 
 // codexScopeKey is where the choice is kept: "profile" or nothing.
 const codexScopeKey = "codex.scope"
@@ -153,6 +156,28 @@ func codexProfileIn(at place) *Agent {
 		UA:     []string{"codex", "acp-extension-codex"},
 		Unwire: drop,
 		Routed: wired,
+		// Uninstall's leftovers, not quit (quit is EndCodexFailover). A
+		// profile whose model no longer resolves reads as not connected,
+		// so Disconnect never runs and magpie.config.toml would keep
+		// Codex on a gateway that is gone. The same call takes magpie's
+		// leftover base URL and provider out of config.toml: a profile
+		// scope can sit beside them (#7452). A model_provider or
+		// openai_base_url the user owns stays, with the config agent's
+		// own gates.
+		TakeLeftovers: func() (bool, error) {
+			took := false
+			if get("model_provider") == magpieID {
+				if err := drop(); err != nil {
+					return false, err
+				}
+				took = true
+			}
+			more, err := codexConfigIn(at).TakeLeftovers()
+			if err != nil {
+				return took, err
+			}
+			return took || more, nil
+		},
 		Sync: func() error {
 			if !wired() {
 				// the profile names magpie and its list, but not a model

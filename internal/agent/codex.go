@@ -266,6 +266,13 @@ func codexIn(at place) *Agent {
 	if codexProfileOnly(at) {
 		return codexProfileIn(at)
 	}
+	return codexConfigIn(at)
+}
+
+// codexConfigIn wires Codex through config.toml. A profile scope still
+// reaches it from TakeLeftovers: stash can say profile while config.toml
+// keeps magpie's base URL and provider (#7452).
+func codexConfigIn(at place) *Agent {
 	dir := at.codexHome()
 	path := filepath.Join(dir, "config.toml")
 	catalogPath := filepath.Join(dir, "magpie-models.json")
@@ -3222,7 +3229,8 @@ func EndCodexFailover() (ended bool, err error) {
 		return false, err
 	}
 	a := codex(home)
-	if !a.FailingOver() {
+	// the profile wiring has no failover hook; it isn't failing over
+	if a.FailingOver == nil || !a.FailingOver() {
 		return false, nil
 	}
 	if err := a.EndFailover(); err != nil {
@@ -3233,16 +3241,27 @@ func EndCodexFailover() (ended bool, err error) {
 }
 
 // TakeCodexLeftovers takes out of this machine's Codex config what magpie
-// wrote that no Disconnect could name: the base URL at magpie's gateway,
-// and magpie as its provider, where the marks magpie keeps them by are
-// gone with magpie's own files (#3866). It answers whether it changed
-// anything.
+// wrote that no Disconnect could name. Uninstall calls it
+// (uninstall.Agents), after the disconnects. Quit does not: quit calls
+// EndCodexFailover, which only ends account failover. The leftovers are
+// the base URL at magpie's gateway and magpie as its provider, where the
+// marks magpie keeps them by are gone with magpie's own files (#3866),
+// and, when Codex applies to its profile alone, a leftover
+// magpie.config.toml whose model_provider is magpie (the model may no
+// longer resolve) plus any magpie wiring still in config.toml (#7452).
+// A model_provider or openai_base_url the user owns stays. It answers
+// whether it changed anything. A wiring with no TakeLeftovers hook
+// changes nothing.
 func TakeCodexLeftovers() (bool, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return false, err
 	}
-	return codex(home).TakeLeftovers()
+	a := codex(home)
+	if a.TakeLeftovers == nil {
+		return false, nil
+	}
+	return a.TakeLeftovers()
 }
 
 // RelayOpenCodex leaves a relay at the gateway's address for the Codex
@@ -3287,7 +3306,13 @@ var CodexDesktopList func() (b []byte, ok bool)
 // models in the list. No distro is probed for it.
 func CodexOwnOnly() bool {
 	home, err := os.UserHomeDir()
-	if err != nil || !codex(home).FailingOver() {
+	if err != nil {
+		return false
+	}
+	a := codex(home)
+	// a wiring with no failover hook (the profile) is not failover-only;
+	// calling the missing one panicked the models request (#7452)
+	if a.FailingOver == nil || !a.FailingOver() {
 		return false
 	}
 	appliedMu.Lock()
@@ -3320,12 +3345,19 @@ func CodexModelNow() string {
 // CodexSideModel is the model this machine's Codex is set to when it is
 // one of magpie's, picked beside its ChatGPT sign-in (SideModel), for the
 // gateway to answer the Codex app's side turns on (gateway.CodexSideModel).
+// "" when it can't be read, or this Codex has no such hook (the profile
+// wiring): calling the missing one panicked the gateway on a title or
+// prediction (#7452).
 func CodexSideModel() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	return codex(home).SideModel()
+	a := codex(home)
+	if a.SideModel == nil {
+		return ""
+	}
+	return a.SideModel()
 }
 
 // CodexSideSet says whether this machine's Codex config names the model
