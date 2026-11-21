@@ -83,7 +83,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // each block: whether it is the top one, its label, its keys, its
         // note, and where it sits among the accounts, Routing and Models.
         // Routing is inside Advanced, so it is not a direct row of the
-        // editor; the top block is still before it.
+        // editor; the top block is still before it. The block is not marked
+        // with the header's class "top" (#7353).
         const seen = await ed.evaluate((ed, w) => {
           const e = ed.querySelector(":scope > .ebody") || ed, kids = [...e.children];
           const at = (x) => kids.findIndex((k) => k.contains(x));
@@ -94,7 +95,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           return {
             accounts, models, hasRouting: !!routing,
             blocks: [...e.querySelectorAll(".plugin-options")].map((b) => ({
-              top: b.classList.contains("top"), at: at(b), beforeRouting: before(b, routing),
+              top: at(b) > accounts && at(b) < models, at: at(b), beforeRouting: before(b, routing),
               label: kids[at(b) - 1].textContent,
               keys: [...b.querySelectorAll(".plugin-option")].map((o) => o.dataset.key),
               note: !!kids[at(b)].querySelector(":scope > .hint"),

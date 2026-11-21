@@ -8004,6 +8004,9 @@ function rateWindowsField() {
 // confirmed first where it asks, kept as draft.pluginOptions[key]. Those
 // that say placement "top" are drawn under the accounts, above Routing
 // (#5269); the rest under the models. The note goes with the first drawn.
+// The top block is the same stack as the other. It does not take the
+// header's class "top": that rule is the title bar, height 46px, and a
+// Mac window's own padding and height (#7353).
 function pluginOptionsField(sub, top) {
   const all = sub?.plugin?.options || [];
   const opts = all.filter((o) => (o.placement === "top") === !!top);
@@ -8036,7 +8039,6 @@ function pluginOptionsField(sub, top) {
     row.append(text, draw());
     box.append(row);
   }
-  box.classList.toggle("top", !!top);
   return field(t("Plugin options"), box, first ? t("{plugin} declares these and reads them as it works; nothing runs on its own when one changes.", { plugin: sub.plugin.name || sub.plugin.pid }) : "");
 }
 // a plugin option's words in the window's language (plugins#590)

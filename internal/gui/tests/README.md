@@ -369,6 +369,12 @@ doesn't know, drawn as before; the note with the first block only; the top
 switch saved like any other. Chromium and WebKit, 1100 and 420 wide, every
 language.
 
+`plugin-option-top-fit.test.cjs` checks that those top options keep the
+stack's own height, padding and alignment (#7353). Three of them, and one,
+with descriptions, sit inside the stack above the rendered Models section
+without overlapping it; the window's title bar keeps its window-type height
+(50px on a Mac window, 46px otherwise). Chromium and WebKit, 1100 and 420 wide.
+
 `plugin-move-overflow.test.cjs` checks a Plugins card that offers a
 built-in's accounts: the button is one word beside the name, as Install is
 ("Move", its title saying whose accounts and how many), on one line, and it
