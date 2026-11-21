@@ -29,11 +29,13 @@ import { AsyncLocalStorage } from "node:async_hooks"
 import { createHash, randomUUID } from "node:crypto"
 import dns from "node:dns"
 import fs from "node:fs"
+import http from "node:http"
 import http2 from "node:http2"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import readline from "node:readline"
+import { createRequire } from "node:module"
 import { Duplex } from "node:stream"
 import tls from "node:tls"
 import { pathToFileURL } from "node:url"
@@ -528,7 +530,7 @@ const reach = new AsyncLocalStorage()
 // sent is a fetch as the plugin asked it, through each redirect it may
 // follow (followed); hop is one request of it, through its proxy.
 function sent(input, init) {
-  const redirect = init?.redirect ?? (input instanceof Request ? input.redirect : undefined) ?? "follow"
+  const redirect = init?.redirect ?? (input instanceof Request || isRequestObject(input) ? input.redirect : undefined) ?? "follow"
   if (redirect !== "follow") return hop(input, init)
   return followed(input, init)
 }
@@ -561,12 +563,43 @@ function sameOrigin(from, to) {
 async function followed(input, init) {
   let url, opts
   if (input instanceof Request) {
-    const body = init && "body" in init ? init.body : input.body ? await input.arrayBuffer() : undefined
-    opts = { method: input.method, headers: input.headers, signal: input.signal, ...init, body }
+    const body = init?.body !== undefined ? init.body : input.body ? await input.arrayBuffer() : undefined
+    opts = copyWith(init, {
+      method: init?.method !== undefined ? init.method : input.method,
+      headers: init?.headers !== undefined ? init.headers : input.headers,
+      signal: init?.signal !== undefined ? init.signal : input.signal,
+      body,
+    })
     url = input.url
+  } else if (isRequestObject(input)) {
+    url = String(input.url instanceof URL ? input.url.href : input.url)
+    const body = init?.body !== undefined ? init.body : input.body
+    const patch = {
+      method: init?.method !== undefined ? init.method : input.method,
+      headers: init?.headers !== undefined ? init.headers : input.headers,
+      signal: init?.signal !== undefined ? init.signal : input.signal,
+      body,
+    }
+    if (init && typeof init === "object") {
+      const norm = copyWith(init)
+      for (const k of Reflect.ownKeys(norm)) {
+        if (norm[k] !== undefined && !(k in patch)) patch[k] = norm[k]
+      }
+      for (let p = Object.getPrototypeOf(norm); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+        for (const k of Reflect.ownKeys(p)) {
+          if (k === "constructor" || k in patch) continue
+          const d = Object.getOwnPropertyDescriptor(p, k)
+          if (d?.enumerable || d?.get) {
+            const v = norm[k]
+            if (v !== undefined) patch[k] = v
+          }
+        }
+      }
+    }
+    opts = copyWith(input, patch)
   } else {
     url = String(input instanceof URL ? input.href : input)
-    opts = { ...init }
+    opts = copyWith(init)
   }
   const first = new URL(url)
   let method = (opts.method ?? "GET").toUpperCase()
@@ -576,7 +609,7 @@ async function followed(input, init) {
   const replayable = body == null || !(body instanceof ReadableStream)
   const bare = () => body == null && [...headers.keys()].every((k) => BARE_HEADERS.has(k))
   for (let n = 0; ; n++) {
-    const res = await hop(url, { ...opts, method, headers, body, redirect: "manual" })
+    const res = await hop(url, copyWith(opts, { method, headers, body, redirect: "manual" }))
     const at = res.headers.get("location")
     if (!REDIRECTS.has(res.status) || at == null) return n ? said(res, url) : res
     let next
@@ -618,7 +651,7 @@ async function hop(input, init) {
   if (init && "proxy" in init) return bunFetch(input, init).catch((e) => throwTLS(e, input))
   const p = await proxyFor(input)
   if (!p) return bunFetch(input, init).catch((e) => throwTLS(e, input))
-  return bunFetch(input, { ...init, proxy: p }).catch(async (e) => {
+  return bunFetch(input, copyWith(init, { proxy: p })).catch(async (e) => {
     if (e?.name === "AbortError" || init?.signal?.aborted) throw e
     const why = await proxyRefuses(p, input)
     if (why) throw Object.assign(new Error(`proxyconnect tcp: ${why}`), { code: e?.code, cause: e })
@@ -726,28 +759,117 @@ function asked(input, init) {
   )
 }
 
-// MAGPIE_ONLY are the headers magpie tells a plugin's fetch where the agent
-// that asked works (WorkDirHeader and WorkGitHeader in internal/provider),
-// that a queue needn't be waited out (FallbackHeader), and the session and
+// MAGPIE_ONLY are the headers magpie tells a plugin where the agent that
+// asked works (WorkDirHeader and WorkGitHeader in internal/provider), that
+// a queue needn't be waited out (FallbackHeader), and the session and
 // subagent the agent named (SessionToPluginHeader, SubagentToPluginHeader)
 // and the effort asked of a model with variants (EffortHeader), and the
 // agent the request came from (CallerAgentHeader and the two beside it):
 // for the plugin to read, never for its vendor, so a plugin that sends on
-// the headers it was given sends them nowhere.
+// the headers it was given sends them nowhere. fetch strips them (unsaid),
+// and so do WebSocket, Bun.FetchSession, node:http, node:https, node:http2,
+// require("ws") and require("undici"). Bun.fetch cannot be wrapped
+// (patchBunFetch), and neither can `import { WebSocket } from "node:http"`
+// or `import WebSocket from "ws"`.
 const MAGPIE_ONLY = ["x-magpie-work-dir", "x-magpie-work-git", "x-magpie-fallback", "x-magpie-session", "x-magpie-subagent", "x-magpie-effort", "x-magpie-caller-agent", "x-magpie-caller-name", "x-magpie-caller-via"]
+const MAGPIE_ONLY_SET = new Set(MAGPIE_ONLY)
+
+function headerName(name) {
+  if (typeof name === "string") return name
+  if (name instanceof String) return name.valueOf()
+  if (ArrayBuffer.isView(name)) return Buffer.from(name.buffer, name.byteOffset, name.byteLength).toString("latin1")
+  if (typeof name === "object" && name !== null) {
+    try {
+      return String(name)
+    } catch {
+      return ""
+    }
+  }
+  return ""
+}
+
+function isMagpieOnly(name) {
+  const s = headerName(name)
+  return s !== "" && MAGPIE_ONLY_SET.has(s.toLowerCase())
+}
+
+function isRequestObject(x) {
+  return x != null && typeof x === "object" && !(x instanceof Request) && !(x instanceof URL) && x.url !== undefined
+}
+
+function isTupleSeq(e) {
+  return Array.isArray(e) || (e != null && typeof e === "object" && !ArrayBuffer.isView(e) && !(e instanceof String) && typeof e[Symbol.iterator] === "function")
+}
+
+function isOneShotHeaders(raw) {
+  if (raw == null || typeof raw !== "object") return false
+  if (typeof Headers === "function" && raw instanceof Headers) return false
+  if (raw instanceof Map) return false
+  if (Array.isArray(raw)) return raw.some((e) => e != null && typeof e === "object" && !Array.isArray(e) && !ArrayBuffer.isView(e) && !(e instanceof String) && typeof e[Symbol.iterator] === "function")
+  return typeof raw[Symbol.iterator] === "function"
+}
+
+// copyWith makes a shallow copy of obj keeping its prototype chain, with
+// own enumerable properties and patch defined via [[DefineOwnProperty]] so
+// prototype setters are never invoked, frozen/getter-only prototypes never
+// throw, inherited fields (method, body, query, signal, protocols) are never
+// dropped, and the caller's object is never written. A Request passed as
+// fetch init is normalized to a plain object so brand-checked getters stay
+// safe while keeping body: null and standard Request fields.
+function copyWith(obj, patch) {
+  if (!obj || typeof obj !== "object") return { ...patch }
+  const isReq = typeof Request === "function" && obj instanceof Request
+  const out = isReq ? {} : Object.create(Object.getPrototypeOf(obj))
+  if (isReq) {
+    for (const k of ["method", "headers", "body", "signal", "redirect", "credentials", "mode", "cache", "referrer", "referrerPolicy", "integrity"]) {
+      if (patch && Object.hasOwn(patch, k)) continue
+      Object.defineProperty(out, k, { value: obj[k], writable: true, enumerable: true, configurable: true })
+    }
+  }
+  const defs = Object.getOwnPropertyDescriptors(obj)
+  for (const k of Reflect.ownKeys(defs)) {
+    if (!defs[k].enumerable || (patch && Object.hasOwn(patch, k))) continue
+    Object.defineProperty(out, k, { value: obj[k], writable: true, enumerable: true, configurable: true })
+  }
+  if (patch) {
+    for (const k of Reflect.ownKeys(patch)) {
+      Object.defineProperty(out, k, { value: patch[k], writable: true, enumerable: true, configurable: true })
+    }
+  }
+  return out
+}
 
 function unsaid(input, init) {
+  if (init?.headers != null) {
+    const raw = init.headers
+    const h = new Headers(raw)
+    const stripped = MAGPIE_ONLY.some((k) => h.has(k))
+    if (stripped) for (const k of MAGPIE_ONLY) h.delete(k)
+    // new Headers(raw) drains a one-shot iterator (Headers.entries(),
+    // Map.entries(), a generator, or an array of inner iterators); replace
+    // it with the materialized Headers even when no MAGPIE_ONLY name was
+    // present, so the caller's own headers are not lost. init.headers
+    // completely replaces input.headers, so input is left untouched (and a
+    // consumed Request body is never cloned).
+    if (stripped || isOneShotHeaders(raw)) init = copyWith(init, { headers: h })
+    return [input, init]
+  }
   if (input instanceof Request && MAGPIE_ONLY.some((k) => input.headers.has(k))) {
     const h = new Headers(input.headers)
     for (const k of MAGPIE_ONLY) h.delete(k)
-    input = new Request(input, { headers: h })
-  }
-  if (init?.headers) {
-    const h = new Headers(init.headers)
-    if (MAGPIE_ONLY.some((k) => h.has(k))) {
-      for (const k of MAGPIE_ONLY) h.delete(k)
-      init = { ...init, headers: h }
+    if (init?.body !== undefined) {
+      // init.body replaces input's body; passing body: null avoids cloning a
+      // consumed Request body or prematurely locking an init ReadableStream.
+      input = new Request(input, { method: init.method ?? input.method, headers: h, body: null })
+    } else {
+      input = new Request(input, { headers: h })
     }
+  } else if (isRequestObject(input) && input.headers != null) {
+    const raw = input.headers
+    const h = new Headers(raw)
+    const stripped = MAGPIE_ONLY.some((k) => h.has(k))
+    if (stripped) for (const k of MAGPIE_ONLY) h.delete(k)
+    if (stripped || isOneShotHeaders(raw)) input = copyWith(input, { headers: h })
   }
   return [input, init]
 }
@@ -762,8 +884,8 @@ const signInSignal = new AsyncLocalStorage()
 function whileSigningIn(input, init) {
   const signal = signInSignal.getStore()
   if (!signal) return [input, init]
-  const own = init?.signal ?? (input instanceof Request ? input.signal : undefined)
-  return [input, { ...init, signal: own ? AbortSignal.any([own, signal]) : signal }]
+  const own = init?.signal ?? (input instanceof Request || isRequestObject(input) ? input.signal : undefined)
+  return [input, copyWith(init, { signal: own ? AbortSignal.any([own, signal]) : signal })]
 }
 
 globalThis.fetch = Object.assign(function fetch(input, init) {
@@ -779,6 +901,412 @@ globalThis.fetch = Object.assign(function fetch(input, init) {
     },
   )
 }, bunFetch)
+
+// A header list as node:http takes one: pairs ([name, value, ...]) or a
+// flat list (name, value, name, value). An odd flat list is left odd, so
+// the original still refuses it. Symbol keys are copied onto the new list
+// (http2.sensitiveHeaders on a flat array). The caller's list is not changed.
+// stripStoredHeaders is the object _storeHeader receives. With no magpie
+// name it is returned as itself (the internal map). Otherwise it is a
+// plain name-to-value map: Bun's tuple entries [name, value, ...] become
+// that value, and a value that is already a string stays one.
+function stripStoredHeaders(headers) {
+  let magpie = false
+  for (const k of Object.keys(headers)) if (isMagpieOnly(k)) { magpie = true; break }
+  if (!magpie) return headers
+  const out = Object.create(null)
+  for (const k of Object.keys(headers)) {
+    if (isMagpieOnly(k)) continue
+    const v = headers[k]
+    if (Array.isArray(v) && v.length >= 2 && typeof v[0] === "string" && v[0].toLowerCase() === String(k).toLowerCase()) out[v[0]] = v.length === 2 ? v[1] : v.slice(1)
+    else out[k] = v
+  }
+  for (const s of Object.getOwnPropertySymbols(headers)) out[s] = headers[s]
+  return out
+}
+
+function stripFlatHeaderList(headers) {
+  const next = []
+  for (let i = 0; i + 1 < headers.length; i += 2) {
+    if (!isMagpieOnly(headers[i])) next.push(headers[i], headers[i + 1])
+  }
+  if (headers.length % 2 === 1) next.push(headers[headers.length - 1])
+  for (const s of Object.getOwnPropertySymbols(headers)) next[s] = headers[s]
+  return next
+}
+
+function stripTupleHeaderList(headers) {
+  const next = []
+  for (const entry of headers) {
+    if (entry == null) {
+      next.push(entry)
+      continue
+    }
+    const pair = Array.isArray(entry) ? entry : isTupleSeq(entry) ? Array.from(entry) : entry
+    if (!isMagpieOnly(pair?.[0])) next.push(pair)
+  }
+  for (const s of Object.getOwnPropertySymbols(headers)) next[s] = headers[s]
+  return next
+}
+
+// stripHeadersInit is headers as fetch, WebSocket and undici.request take them,
+// without MAGPIE_ONLY. A Headers is copied; a tuple list is copied; an iterable
+// of pairs (a Map, Headers.entries(), a custom iterator) becomes a
+// null-prototype name map with duplicate names combined as ", ", matching
+// Headers/WebSocket/undici; a plain object is copied onto a null-prototype
+// map, its symbol keys kept (http2's sensitive-headers symbol). Nothing of
+// the caller's is written.
+function stripHeadersInit(headers) {
+  if (headers == null) return headers
+  if (typeof Headers === "function" && headers instanceof Headers) {
+    const h = new Headers(headers)
+    for (const k of MAGPIE_ONLY) h.delete(k)
+    return h
+  }
+  if (Array.isArray(headers)) return stripTupleHeaderList(headers)
+  if (typeof headers === "object" && typeof headers[Symbol.iterator] === "function") {
+    const out = Object.create(null)
+    const keys = Object.create(null)
+    for (const entry of headers) {
+      if (entry == null) continue
+      const pair = Array.isArray(entry) ? entry : isTupleSeq(entry) ? Array.from(entry) : entry
+      const name = pair[0]
+      if (name == null) continue
+      const strName = headerName(name) || String(name)
+      if (isMagpieOnly(strName)) continue
+      const lower = strName.toLowerCase()
+      const val = pair[1]
+      if (lower in keys) {
+        const prev = keys[lower]
+        out[prev] = `${out[prev]}, ${val}`
+      } else {
+        keys[lower] = strName
+        out[strName] = val
+      }
+    }
+    for (const s of Object.getOwnPropertySymbols(headers)) if (s !== Symbol.iterator) out[s] = headers[s]
+    return out
+  }
+  if (typeof headers === "object") {
+    const out = Object.create(null)
+    for (const k of Object.keys(headers)) if (!isMagpieOnly(k)) out[k] = headers[k]
+    for (const s of Object.getOwnPropertySymbols(headers)) out[s] = headers[s]
+    return out
+  }
+  return headers
+}
+
+// Bun's WebSocket takes a protocols string, an array of them, or
+// {headers, protocols, ...}. The ws package also takes
+// (url, protocols, options). Only an options object's headers are
+// magpie's to take off. Inherited fields stay on the prototype of the
+// object handed to the constructor, and the caller's object is not
+// written. The constructor Bun ships is native, so the wrapper builds
+// the socket with it and keeps its prototype: a plugin's
+// `instanceof WebSocket` still holds.
+function stripWSOptions(protocols) {
+  if (!protocols || typeof protocols !== "object" || Array.isArray(protocols) || protocols.headers === undefined) return protocols
+  return copyWith(protocols, { headers: stripHeadersInit(protocols.headers) })
+}
+
+function wrapWebSocket(WS) {
+  if (typeof WS !== "function" || WS.__magpieStripped) return WS
+  function WebSocket(url, protocols, options) {
+    const args = Array.from(arguments)
+    if (args.length >= 2) args[1] = stripWSOptions(protocols)
+    if (args.length >= 3) args[2] = stripWSOptions(options)
+    return Reflect.construct(WS, args, new.target)
+  }
+  WebSocket.prototype = WS.prototype
+  Object.setPrototypeOf(WebSocket, WS)
+  Object.defineProperty(WebSocket, "__magpieStripped", { value: true })
+  return WebSocket
+}
+
+if (typeof globalThis.WebSocket === "function") {
+  const wrapped = wrapWebSocket(globalThis.WebSocket)
+  globalThis.WebSocket = wrapped
+  // node:http re-exports the same constructor as its own property, which
+  // does not follow the global. A named import of it is a copy Bun does
+  // not update; the global and http.WebSocket are what a plugin calls.
+  try {
+    if (typeof http.WebSocket === "function") http.WebSocket = wrapped
+  } catch {
+    // a build that freezes the export keeps the global wrapper only
+  }
+}
+
+// node:http stores an object's headers through setHeader and an array's
+// through _storeHeader, which writes the block without setHeader (Bun
+// 1.4.2). https.request builds a node:http ClientRequest, so one wrap
+// covers both. Named imports and require() close over the original
+// request function; they still construct that ClientRequest, whose
+// prototype this is. A name magpie owns is left unset. Every other
+// header, and the Host the client adds itself, is sent as the plugin asked.
+{
+  const proto = http.OutgoingMessage?.prototype
+  if (proto && typeof proto.setHeader === "function" && !proto.setHeader.__magpieStripped) {
+    const origSet = proto.setHeader
+    function setHeader(name, value) {
+      if (isMagpieOnly(name)) return this
+      return origSet.call(this, name, value)
+    }
+    Object.defineProperty(setHeader, "__magpieStripped", { value: true })
+    proto.setHeader = setHeader
+    if (typeof proto.appendHeader === "function") {
+      const origAppend = proto.appendHeader
+      proto.appendHeader = function appendHeader(name, value) {
+        if (isMagpieOnly(name)) return this
+        return origAppend.call(this, name, value)
+      }
+    }
+    if (typeof proto._storeHeader === "function") {
+      const origStore = proto._storeHeader
+      proto._storeHeader = function _storeHeader(firstLine, headers) {
+        // the internal map is passed by identity; setHeader already kept
+        // magpie's names out of it, so a clean object stays that object.
+        // An array is the caller's header list. An object assigned over
+        // _headers never went through setHeader. Bun stores that object as
+        // a null-prototype map of [name, value] tuples and only reads it
+        // that way when it is the same object: a copy of the tuples is
+        // sent twice, so a map that still has a magpie name is rewritten
+        // as name to value before it is stored.
+        // Bun's _storeHeader treats an array as tuples only when
+        // Array.isArray(headers[0]), and otherwise as a flat [k, v, ...] list
+        // (where odd-index values may themselves be multi-value arrays).
+        if (Array.isArray(headers)) {
+          headers = headers.length > 0 && Array.isArray(headers[0]) ? stripTupleHeaderList(headers) : stripFlatHeaderList(headers)
+        } else if (headers != null && typeof headers === "object") headers = stripStoredHeaders(headers)
+        return origStore.call(this, firstLine, headers)
+      }
+    }
+    if (typeof proto.addTrailers === "function" && !proto.addTrailers.__magpieStripped) {
+      const origTrail = proto.addTrailers
+      function addTrailers(headers) {
+        if (Array.isArray(headers)) headers = stripTupleHeaderList(headers)
+        else if (headers != null && typeof headers === "object") headers = stripHeadersInit(headers)
+        return origTrail.call(this, headers)
+      }
+      Object.defineProperty(addTrailers, "__magpieStripped", { value: true })
+      proto.addTrailers = addTrailers
+    }
+  }
+}
+
+// node:http2's session.request copies its headers and gives them to the
+// session, not to node:http. An array is always a flat list (even when
+// header values are multi-value arrays); an object is the names. :method
+// and :path are not magpie's and stay. Http2Stream is not exported on Bun
+// 1.4.5, so its sendTrailers is wrapped from the first stream
+// session.request returns.
+{
+  const proto = http2.ClientHttp2Session?.prototype
+  if (proto && typeof proto.request === "function" && !proto.request.__magpieStripped) {
+    const orig = proto.request
+    function wrapStreamTrailers(stream) {
+      if (!stream || typeof stream.sendTrailers !== "function" || stream.sendTrailers.__magpieStripped) return
+      for (let p = Object.getPrototypeOf(stream); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+        if (!Object.hasOwn(p, "sendTrailers")) continue
+        const origTrailers = p.sendTrailers
+        if (typeof origTrailers !== "function" || origTrailers.__magpieStripped) return
+        function sendTrailers(headers) {
+          const args = Array.from(arguments)
+          if (args.length > 0 && args[0] != null) {
+            args[0] = Array.isArray(args[0]) ? stripFlatHeaderList(args[0]) : stripHeadersInit(args[0])
+          }
+          return origTrailers.apply(this, args)
+        }
+        Object.defineProperty(sendTrailers, "__magpieStripped", { value: true })
+        try {
+          p.sendTrailers = sendTrailers
+        } catch {}
+        return
+      }
+    }
+    function request(headers, options) {
+      const args = Array.from(arguments)
+      if (args.length > 0 && args[0] != null) {
+        args[0] = Array.isArray(args[0]) ? stripFlatHeaderList(args[0]) : stripHeadersInit(args[0])
+      }
+      const stream = orig.apply(this, args)
+      wrapStreamTrailers(stream)
+      return stream
+    }
+    Object.defineProperty(request, "__magpieStripped", { value: true })
+    proto.request = request
+  }
+}
+
+// patchBunFetch wraps Bun.fetch when the build allows it. On Bun 1.4.2
+// Object.getOwnPropertyDescriptor(Bun, "fetch") is {writable: false,
+// configurable: false}, Bun itself is the same, and assignment and
+// Object.defineProperty both throw ("Attempting to change configurable
+// attribute of unconfigurable property"). Bun.fetch is not globalThis.fetch,
+// so the wrap above does not cover it: a plugin that calls Bun.fetch still
+// sends MAGPIE_ONLY, and still skips the host's proxy (#5520).
+try {
+  const orig = Bun?.fetch
+  if (typeof orig === "function") {
+    const wrapped = Object.assign(function fetch(input, init) {
+      const args = Array.from(arguments)
+      if (args.length > 0) {
+        const next = unsaid(args[0], args[1])
+        args[0] = next[0]
+        if (args.length > 1) args[1] = next[1]
+      }
+      return orig.apply(this, args)
+    }, orig)
+    Object.defineProperty(Bun, "fetch", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: wrapped,
+    })
+  }
+} catch {
+  // read-only, as on the bundled Bun 1.4.2
+}
+
+// Bun.FetchSession is writable on Bun 1.4.4 and 1.4.5, where Bun.fetch is
+// not. Its fetch getter only answers on an instance and returns a cached
+// bound function (so `const { fetch } = session` works detached). Keep
+// that getter contract via a per-instance WeakMap. A build that freezes
+// FetchSession keeps the original, and the host still starts.
+try {
+  const Orig = Bun?.FetchSession
+  const desc = typeof Orig === "function" ? Object.getOwnPropertyDescriptor(Bun, "FetchSession") : undefined
+  if (desc && (desc.writable || desc.configurable) && !Orig.__magpieStripped) {
+    const bound = new WeakMap()
+    class FetchSession extends Orig {
+      get fetch() {
+        const origFetch = super.fetch
+        let fn = bound.get(this)
+        if (!fn) {
+          fn = Object.assign(function fetch(input, init) {
+            const args = Array.from(arguments)
+            if (args.length > 0) {
+              const next = unsaid(args[0], args[1])
+              args[0] = next[0]
+              if (args.length > 1) args[1] = next[1]
+            }
+            return origFetch.apply(this, args)
+          }, origFetch)
+          bound.set(this, fn)
+        }
+        return fn
+      }
+    }
+    Object.defineProperty(FetchSession, "__magpieStripped", { value: true })
+    if (desc.configurable) Object.defineProperty(Bun, "FetchSession", { configurable: desc.configurable, enumerable: desc.enumerable, writable: desc.writable, value: FetchSession })
+    else Bun.FetchSession = FetchSession
+  }
+} catch {
+  // no FetchSession, or one this build will not let go of
+}
+
+// patchWritable replaces obj[key] when this Bun allows it. A frozen
+// export is left alone, so a later build cannot stop the host from starting.
+function patchWritable(obj, key, wrap) {
+  if (obj == null) return
+  let desc
+  try {
+    desc = Object.getOwnPropertyDescriptor(obj, key)
+  } catch {
+    return
+  }
+  if (!desc || typeof desc.value !== "function" || (!desc.writable && !desc.configurable)) return
+  let wrapped
+  try {
+    wrapped = wrap(desc.value)
+  } catch {
+    return
+  }
+  if (typeof wrapped !== "function" || wrapped === desc.value) return
+  try {
+    if (desc.configurable) Object.defineProperty(obj, key, { configurable: desc.configurable, enumerable: desc.enumerable, writable: desc.writable, value: wrapped })
+    else obj[key] = wrapped
+  } catch {
+    // read-only on this build
+  }
+}
+
+function wrapUndiciFetch(orig) {
+  if (typeof orig !== "function" || orig.__magpieStripped) return orig
+  function fetch(input, init) {
+    const args = Array.from(arguments)
+    if (args.length > 0) {
+      const next = unsaid(args[0], args[1])
+      args[0] = next[0]
+      if (args.length > 1) args[1] = next[1]
+    }
+    return orig.apply(this, args)
+  }
+  Object.assign(fetch, orig)
+  Object.defineProperty(fetch, "__magpieStripped", { value: true })
+  return fetch
+}
+
+function wrapUndiciRequest(orig) {
+  if (typeof orig !== "function" || orig.__magpieStripped) return orig
+  function request(url, opts) {
+    const args = Array.from(arguments)
+    if (args.length > 1 && opts && typeof opts === "object" && opts.headers != null) args[1] = copyWith(opts, { headers: stripHeadersInit(opts.headers) })
+    return orig.apply(this, args)
+  }
+  Object.defineProperty(request, "__magpieStripped", { value: true })
+  return request
+}
+
+// require("ws") is the constructor, and .WebSocket is the same function
+// until it is replaced. The module cache is writable, so a later
+// require("ws") and require("ws").WebSocket are the wrapper. The ESM
+// default `import WebSocket from "ws"` stays the built-in constructor.
+// require("undici").fetch, request and WebSocket are writable, and its
+// default export is that same object, so a default import follows.
+// Named ESM bindings are copies made the first time the module is
+// evaluated: a plugin that imports undici or { WebSocket } from "ws"
+// after this runs gets the wrappers. `import { WebSocket } from
+// "node:http"` does not, because the host already loaded that module.
+try {
+  const require = createRequire(import.meta.url)
+  try {
+    const ws = require("ws")
+    const orig = typeof ws === "function" ? ws : ws?.WebSocket
+    if (typeof orig === "function") {
+      const wrapped = wrapWebSocket(orig)
+      wrapped.WebSocket = wrapped
+      try {
+        const cached = require.cache[require.resolve("ws")]
+        if (cached && (cached.exports === orig || cached.exports === ws)) cached.exports = wrapped
+      } catch {
+        // the property below is the one a named import reads
+      }
+      try {
+        orig.WebSocket = wrapped
+      } catch {
+        // the cache replacement still covers require("ws")
+      }
+      if (ws !== orig) patchWritable(ws, "WebSocket", () => wrapped)
+    }
+  } catch {
+    // this Bun has no built-in "ws"
+  }
+  try {
+    const undici = require("undici")
+    const targets = []
+    if (undici != null) targets.push(undici)
+    if (undici?.default != null && undici.default !== undici) targets.push(undici.default)
+    for (const obj of targets) {
+      patchWritable(obj, "fetch", wrapUndiciFetch)
+      patchWritable(obj, "request", wrapUndiciRequest)
+      patchWritable(obj, "WebSocket", wrapWebSocket)
+    }
+  } catch {
+    // this Bun has no built-in "undici"
+  }
+} catch {
+  // createRequire failed; the global and node:http wraps above still hold
+}
 
 // An HTTP/2 session a plugin opens itself goes through the proxy its
 // fetches take, as a built-in's requests on Go's transport did. Cursor's
