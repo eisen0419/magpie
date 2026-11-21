@@ -681,7 +681,7 @@ func (p Provider) cloudflareAccount(ctx context.Context) (string, error) {
 	if ok {
 		return id, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	ctx, cancel := catalog.BoundList(ctx, 20*time.Second)
 	defer cancel()
 	api, _ := p.cloudflareBase()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, api+"/accounts", nil)
@@ -964,7 +964,7 @@ func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
 		}
 		return ms, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	ctx, cancel := catalog.BoundList(ctx, 20*time.Second)
 	defer cancel()
 	switch p.DecideVia() {
 	case ViaVercel:

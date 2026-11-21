@@ -3340,6 +3340,8 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			p = withCerts(typed(p, in, req.Proxy, req.InsecureTLS, req.HTTP1), &p, req.ClientCert, req.ClientKey, req.ServerCA, req.ServerPin, req.Resolve)
 			ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 			defer cancel()
+			// the user asked: the list waits this long, not listBound (#7409)
+			ctx = catalog.WithManualRefresh(ctx)
 			all, err := p.ListAll(ctx)
 			if err != nil {
 				fail(rw, err)
@@ -3379,6 +3381,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			// listing of every provider, which may spend all of it (#4065)
 			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 			defer cancel()
+			// the user asked: a list that takes 11s is the list, not an
+			// 8s timeout inside fetchOne (#7409)
+			ctx = catalog.WithManualRefresh(ctx)
 			ask := *p
 			if req.Typed {
 				ask = withCerts(typed(*p, in, req.Proxy, req.InsecureTLS, req.HTTP1), p, req.ClientCert, req.ClientKey, req.ServerCA, req.ServerPin, req.Resolve)

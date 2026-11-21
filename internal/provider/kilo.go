@@ -66,7 +66,7 @@ func (p Provider) IsKilo() bool {
 func (p Provider) kiloModels(ctx context.Context) ([]catalog.Model, string, error) {
 	base := strings.TrimRight(strings.TrimSpace(p.Chat), "/")
 	u := base + "/models"
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := catalog.BoundList(ctx, 10*time.Second)
 	defer cancel()
 	var ms []catalog.Model
 	err := catalog.Paged(u, func(at string) (bool, string, error) {

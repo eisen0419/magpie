@@ -58,7 +58,11 @@ func (p Provider) codexEntries(ctx context.Context, list string, ms []catalog.Mo
 	q := u.Query()
 	q.Set("client_version", codexVersion())
 	u.RawQuery = q.Encode()
-	got, err := catalog.FetchURL(ctx, u.String(), p.Key, false, p.listHeadersAt(list))
+	// optional: a stall here must not use up a manual refresh's deadline
+	// before noteRemoteHub or fetchDecide (ProbeBound, #7409)
+	probe, cancel := catalog.ProbeBound(ctx)
+	defer cancel()
+	got, err := catalog.FetchURL(probe, u.String(), p.Key, false, p.listHeadersAt(list))
 	if err != nil {
 		got, _, _ = catalog.Live(p.ID)
 	}

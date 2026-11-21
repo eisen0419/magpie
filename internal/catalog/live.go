@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
@@ -791,13 +792,108 @@ const modelPages = 20
 // accepts: a real catalog of its own fits in one or two pages of it.
 const PageLimit = 1000
 
+// listBound is how long one model-list request waits unless the caller
+// asked to use its own deadline (WithManualRefresh). A background fetch
+// keeps this cap even when its parent context waits longer: KeepListsFresh
+// gives the whole refetch a minute, RefreshLists and FetchNew pass their
+// own, and a test or a startup fetch often passes context.Background().
+// Tests shrink it; the real cap is the 8s a hung vendor used to cost.
+var listBound atomic.Int64
+
+func init() {
+	listBound.Store(int64(8 * time.Second))
+}
+
+func currentListBound() time.Duration {
+	return time.Duration(listBound.Load())
+}
+
+// SetListBoundForTest sets how long a background model-list request waits,
+// for a test, and returns a function that puts the previous value back.
+// A caller-level test shrinks it (50ms) under a vendor that answers later
+// (150ms): the fetch fails when the caller forgot WithManualRefresh, and
+// passes when it didn't, without waiting the real 8s. The caller restores
+// it before the test ends (t.Cleanup).
+func SetListBoundForTest(d time.Duration) func() {
+	was := listBound.Swap(int64(d))
+	return func() { listBound.Store(was) }
+}
+
+type manualRefreshKey struct{}
+
+// WithManualRefresh marks ctx as a list the user asked for: Fetch models
+// in the editor and on the add form, `magpie provider refresh`, the TUI's
+// refetch, and the fetch when a provider is added. fetchOne and geminiPage
+// then keep ctx's deadline and cancellation instead of cutting the request
+// off at listBound, so a list that answers in 11s is the list (#7409). A
+// ctx with no deadline still gets listBound, so a manual refresh that
+// forgot one cannot hang. The request goes out on http.DefaultClient,
+// which has no Timeout of its own: this context is what ends it.
+func WithManualRefresh(ctx context.Context) context.Context {
+	return context.WithValue(ctx, manualRefreshKey{}, true)
+}
+
+func manualRefresh(ctx context.Context) bool {
+	on, _ := ctx.Value(manualRefreshKey{}).(bool)
+	return on
+}
+
+// keepCallerDeadline reports whether ctx is a manual refresh that already
+// has a deadline, so the list uses that deadline instead of a cap.
+func keepCallerDeadline(ctx context.Context) bool {
+	if !manualRefresh(ctx) {
+		return false
+	}
+	_, ok := ctx.Deadline()
+	return ok
+}
+
+// boundList is the context one list request runs under. A manual refresh
+// that already has a deadline keeps it: the caller's cancel and deadline
+// are the request's, and cancelling this attempt (when the fetch returns)
+// does not cancel the caller, which may ask another URL next. Anything
+// else is cut off at listBound, and that still ends when ctx does.
+func boundList(ctx context.Context) (context.Context, context.CancelFunc) {
+	if keepCallerDeadline(ctx) {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, currentListBound())
+}
+
+// BoundList is the context one list request runs under when the caller
+// has a cap of its own: kiloModels passes 10s, clineFeed 8s, fetchDecide
+// 20s. A manual refresh that already has a deadline keeps it, and the
+// cancel does nothing, so ending this attempt does not cancel the caller.
+// Anything else is cut off at fallback, or at listBound when fallback is
+// not positive, and that still ends when ctx does. A manual refresh with
+// no deadline takes the fallback too, so one that forgot a deadline
+// cannot hang.
+func BoundList(ctx context.Context, fallback time.Duration) (context.Context, context.CancelFunc) {
+	if keepCallerDeadline(ctx) {
+		return ctx, func() {}
+	}
+	if fallback <= 0 {
+		fallback = currentListBound()
+	}
+	return context.WithTimeout(ctx, fallback)
+}
+
+// ProbeBound is the context an optional second list runs under, such as
+// the Codex client_version probe. It always ends at listBound, sooner
+// when ctx does, even when ctx is a manual refresh whose deadline is
+// longer: the probe only adds to a list already had, and a stall must
+// not expire the caller before the steps after the fetch.
+func ProbeBound(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, currentListBound())
+}
+
 // fetchOne asks the model list at url to its end: the first page as the
 // URL stands, and every page after it with the id it ended at (Paged), so
 // a list that pages is the whole list and not the twenty of its first
 // page — a base whose only list is a paged one (Anthropic's own) has no
 // other answer to fall back on, and was left with none (#1006).
 func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[string]string) ([]Model, error) {
-	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	ctx, cancel := boundList(ctx)
 	defer cancel()
 	var out []Model
 	err := Paged(url, func(at string) (bool, string, error) {

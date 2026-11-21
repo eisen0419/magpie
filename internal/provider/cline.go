@@ -61,7 +61,7 @@ const clineFreePrefix = "cline-free/"
 // plan's preset leaves them out of the API's list.
 func (p Provider) clineFeed(ctx context.Context) ([]catalog.Model, string, error) {
 	u := strings.TrimRight(strings.TrimSpace(p.Chat), "/") + "/ai/cline/recommended-models"
-	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	ctx, cancel := catalog.BoundList(ctx, 8*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {

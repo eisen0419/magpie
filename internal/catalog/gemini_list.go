@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"slices"
 	"strings"
-	"time"
 )
 
 // FetchGemini lists the models at a Gemini API's base (…/v1beta), as
@@ -58,7 +57,7 @@ type geminiModel struct {
 }
 
 func geminiPage(ctx context.Context, u, key string, headers map[string]string) ([]Model, string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	ctx, cancel := boundList(ctx)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {

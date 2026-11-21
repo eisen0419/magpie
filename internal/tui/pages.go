@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/fx"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
@@ -289,6 +290,7 @@ func refetchCmd(id string) tea.Cmd {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		ctx = catalog.WithManualRefresh(ctx) // the user's refetch, not the 8s background cap (#7409)
 		ms, dropped, err := p.Refetch(ctx)
 		if err != nil {
 			return flashMsg{text: p.Name + ": " + fetchNote(err)}
@@ -677,6 +679,7 @@ func addCmd(p provider.Provider) tea.Cmd {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
+		ctx = catalog.WithManualRefresh(ctx) // adding asks the vendor now, as the CLI does (#7409)
 		saved, err := provider.Find(id)
 		if err != nil {
 			return flashMsg{text: err.Error()}

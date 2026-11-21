@@ -811,6 +811,8 @@ func providerCmd(args []string) error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		// the user asked: the list waits this long, not the background cap (#7409)
+		ctx = catalog.WithManualRefresh(ctx)
 		ms, dropped, taken, err := p.RefetchTaking(ctx)
 		if err != nil {
 			return err
@@ -898,6 +900,8 @@ func announce(id string) error {
 	fmt.Println(green.Render("✓"), "added", saved.Name, muted.Render("("+saved.ID+")"))
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	// the user is waiting on this list, same as Fetch models (#7409)
+	ctx = catalog.WithManualRefresh(ctx)
 	if saved.ListsOff() {
 		// its list is never asked for: the models given by id are its
 	} else if ms, err := saved.Fetch(ctx); err == nil {
