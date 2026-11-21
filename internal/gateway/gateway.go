@@ -3620,10 +3620,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	var nestedAt []string
 	if ruleReq != nil && !modelRuled(hit, ms, cands) {
 		picked := ""
+		aside := false
 		if hit != nil {
 			picked = hit.Pick
+			aside = hit.Aside || hit.Compact
 		}
-		nested, nestedAt, cands, pl = s.nestedRules(ruleAt, ruleReq, agent, ask, ruled, cands, pl, aff, picked)
+		nested, nestedAt, cands, pl = s.nestedRules(ruleAt, ruleReq, agent, ask, ruled, cands, pl, aff, picked, aside)
 	}
 	// the effort a group's decision model picked for the turn: the
 	// outermost group's that did
@@ -5934,7 +5936,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// there is (imwhatiam123 on Discord: Stays: Strict moved a
 			// session from Qoder CN to WorkBuddy AI after a reply broke
 			// off, the stick gone and the retry routed as a new one)
-			if (hit == nil || !hit.Compact) && aff.Why != "strict" {
+			if !routingAside(hit, nested) && aff.Why != "strict" {
 				unanswered(stuck, c)
 			}
 			if hw.looped != "" {
@@ -5978,9 +5980,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 			// how fast it answered, for Speed first (speed.go)
 			noteTrySpeed(c, try, call.Usage.Output, call.Usage.Reasoning, ended)
-			// a compaction a rule sent to a model of its own leaves the
-			// conversation, and the turn's size, where they were
-			if hit == nil || !hit.Compact {
+			// a compaction a rule sent to a model of its own, or a side call,
+			// leaves the conversation and the turn's size where they were.
+			// An unruled group has no hit; a ruled group inside it is the
+			// same kind of call and leaves the stick too (#7455).
+			if !routingAside(hit, nested) {
 				answeredStanding(stuck, c, aff.Turn, call.Usage, standsInFor(c, plannedCs, plannedOrder))
 				// what it answered, it holds: whatever it refused as too
 				// long on the way is forgotten (#3453)
@@ -5990,11 +5994,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// fallback whose own native compaction is off too, whose seal
 			// only it can read (#2271)
 			sealedBy = &c
-			if hit != nil && !hit.Compact {
-				ruleAnswered(ruleAt, call.Usage, coldAfter(c.p))
-			}
-			for _, at := range nestedAt {
-				ruleAnswered(at, call.Usage, coldAfter(c.p))
+			if !routingAside(hit, nested) {
+				if hit != nil {
+					ruleAnswered(ruleAt, call.Usage, coldAfter(c.p))
+				}
+				for _, at := range nestedAt {
+					ruleAnswered(at, call.Usage, coldAfter(c.p))
+				}
 			}
 		} else if hw.refused {
 			try.Fail = failRefused

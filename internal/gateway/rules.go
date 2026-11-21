@@ -70,8 +70,14 @@ type RuleHit struct {
 	// Compact: the request is the agent compacting its conversation, looked
 	// at on its own; Small, the members of rules it matched that take less
 	// than it is long, passed over
-	Compact bool     `json:"compact,omitempty"`
-	Small   []string `json:"small,omitempty"`
+	Compact bool `json:"compact,omitempty"`
+	// Aside: the request is a side call — a session title, a progress
+	// summary, a prompt suggestion, a classifier, a compaction a Where
+	// rule caught, or a tool-less call whose system prompt is not the
+	// turn's. It is routed on its own and is not the turn's decision
+	// (#7455).
+	Aside bool     `json:"aside,omitempty"`
+	Small []string `json:"small,omitempty"`
 	// Bare: the group has no rules, only its effort picked
 	Bare bool `json:"bare,omitempty"`
 	// Ended: the rule (from 1) that sent the conversation's last turn to
@@ -138,6 +144,11 @@ type turnRule struct {
 	// cold is how long the vendor that answered last keeps the
 	// conversation cached unread (coldAfter); 0 is cacheCold
 	cold time.Duration
+	// sys is the system prompt the turn was decided from, with the
+	// billing line and reminders left out (systemID). A later tool-less
+	// call whose prompt is another one is a side call, not an edit of
+	// this turn (#7455).
+	sys string
 }
 
 var turnRules = struct {
@@ -198,6 +209,10 @@ func firstWords(req *Request) string {
 // still this group's own routing. It returns nil for a group that decides
 // nothing.
 func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, agent string, ask classifier, pick string) *RuleHit {
+	return ruleForMode(key, g, ms, req, agent, ask, pick, false)
+}
+
+func ruleForMode(key string, g provider.Group, ms []provider.Member, req *Request, agent string, ask classifier, pick string, aside bool) *RuleHit {
 	if !g.Ruled() || req == nil {
 		return nil
 	}
@@ -220,14 +235,14 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 			break
 		}
 	}
+	// the prompt's identity, once, before any lock: a side call is told
+	// from an edit by it, and the lock below only copies the short id
+	sys := systemID(req)
 	turnRules.Lock()
 	tr, had := turnRules.m[key]
 	turnRules.Unlock()
 	if had && now.Sub(tr.at) > stickKeep {
 		had = false
-	}
-	if had && tr.input > q.Tokens {
-		q.Tokens = tr.input // what the vendor counted last, a floor: the conversation only grew since
 	}
 	if slices.ContainsFunc(g.Rules, provider.Rule.ByFolder) {
 		q.Folder = workDir(req)
@@ -251,6 +266,12 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		// on its own — not the turn's decision, so the requests after it go
 		// on as the turn would. The request is as long as the conversation:
 		// a model known to take less would only refuse it, and is passed over.
+		// The vendor's last count is a floor here, as it is for a turn: the
+		// summary is the conversation. A side call is not, and is matched
+		// below on its own length.
+		if had && tr.input > q.Tokens {
+			q.Tokens, hit.Tokens = tr.input, tr.input
+		}
 		q.Compact, hit.Compact = true, true
 		ctx := memberContexts(ms)
 		for i, r := range g.Rules {
@@ -277,6 +298,21 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		}
 		return hit
 	}
+	// a side call is matched on its own length and effort without asking
+	// the classifier, and is not written over the turn. That is decided
+	// before the turn's token floor, the intent it was given, or the
+	// effort kept for the vendor's cache: a title after a long turn is
+	// still a short call (#7455).
+	if aside || sideCall(req, tr, had, sys) {
+		if i := provider.MatchRule(g.Rules, q); i >= 0 {
+			hit.N, hit.Use, hit.More, hit.When = i+1, g.Rules[i].Use, g.Rules[i].More, g.Rules[i].Conditions()
+		}
+		hit.Aside = true
+		return hit
+	}
+	if had && tr.input > q.Tokens {
+		q.Tokens, hit.Tokens = tr.input, tr.input // what the vendor counted last, a floor: the conversation only grew since
+	}
 	if within {
 		// the same turn: what was decided as it began, while the group
 		// still has that rule; else nothing moves it
@@ -301,7 +337,7 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		}
 		if grown, ok := outgrown(g, ctx, hit, q); ok {
 			hit = grown
-			turnRules.m[key] = turnRule{turn: turn, use: hit.Use, n: hit.N, at: now, input: tr.input, intent: q.Intent, effort: tr.effort, wanted: tr.wanted, answered: tr.answered, size: size, hour: tr.hour}
+			turnRules.m[key] = turnRule{turn: turn, use: hit.Use, n: hit.N, at: now, input: tr.input, intent: q.Intent, effort: tr.effort, wanted: tr.wanted, answered: tr.answered, size: size, hour: tr.hour, sys: sys}
 			return hit
 		}
 		if had {
@@ -392,9 +428,23 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 	defer turnRules.Unlock()
 	input, answered, hour := tr.input, tr.answered, tr.hour
 	if cur, ok := turnRules.m[key]; ok {
+		if now.Sub(cur.at) <= stickKeep && unrelatedHelper(req, cur, sys) {
+			// the main turn wrote its decision while this tool-less helper
+			// ran concurrently: keep the turn and route the helper on its
+			// own without classifier outputs (#7455)
+			q.Intent, q.Tokens = "", size
+			hit.Tokens = size
+			hit.Classified, hit.Pick, hit.Wanted, hit.Ended = nil, "", "", 0
+			hit.N, hit.Use, hit.More, hit.When = 0, "", nil, nil
+			if i := provider.MatchRule(g.Rules, q); i >= 0 {
+				hit.N, hit.Use, hit.More, hit.When = i+1, g.Rules[i].Use, g.Rules[i].More, g.Rules[i].Conditions()
+			}
+			hit.Aside = true
+			return hit
+		}
 		input, answered, hour = cur.input, cur.answered, cur.hour // answered while the classifier was asked
 	}
-	turnRules.m[key] = turnRule{turn: turn, use: hit.Use, n: hit.N, at: now, input: input, intent: q.Intent, effort: hit.Pick, wanted: hit.Wanted, answered: answered, size: size, hour: hour}
+	turnRules.m[key] = turnRule{turn: turn, use: hit.Use, n: hit.N, at: now, input: input, intent: q.Intent, effort: hit.Pick, wanted: hit.Wanted, answered: answered, size: size, hour: hour, sys: sys}
 	if len(turnRules.m) > 4096 {
 		for k, tr := range turnRules.m {
 			if now.Sub(tr.at) > stickKeep {
@@ -403,6 +453,188 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		}
 	}
 	return hit
+}
+
+// titleSystems open a block of the system prompt of a session-title call.
+// Each is the agent's own, from a request it sent. A title is its own
+// short conversation, and for Qoder, Claude Code, Claude Desktop and
+// DeepSeek Harness it carries the user's words, so it shares the turn's
+// key (ruleKey). Further into a long block it is something quoting the
+// line, as a compaction prompt is (compactLead). A preamble in an earlier
+// block — Claude Code's billing line, an identity paragraph — is not this
+// block, so it does not hide the title (systemTexts).
+var titleSystems = []string{
+	// Qoder Desktop (qoder-1.1.82's title call)
+	"You are an expert conversation summarizer. Your goal is to create a concise, 2-5 word title",
+	// Claude Desktop, and Claude Code when Desktop asks it to title
+	"You write short session titles.",
+	// Claude Code's own title
+	"Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session.",
+	// DeepSeek Harness
+	"Create a concise title for an AI coding-assistant session",
+	// OpenCode
+	"You are a title generator",
+	// pi-rename
+	"You name AI coding-assistant sessions",
+}
+
+// titling reports whether req is an agent asking for a session title.
+// Each block is read as the client sent it (systemTexts): on Anthropic
+// Messages and Chat completions the blocks live in systemRaw, and
+// systemParts is empty.
+func titling(req *Request) bool {
+	if req == nil {
+		return false
+	}
+	texts := req.systemTexts()
+	if len(texts) == 0 && req.System != "" {
+		texts = []string{req.System}
+	}
+	for _, text := range texts {
+		for _, p := range titleSystems {
+			if leads(text, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sideCall reports whether req is a helper beside the turn tr was written
+// for, rather than that turn edited, rewound or sent again. A known helper
+// — a title, a progress summary, a prompt suggestion, the auto mode
+// classifier, a compaction no Compact rule took — is one whenever it
+// arrives. So is a tool-less one-message call whose system prompt is not
+// the stored turn's. A request that carries the turn's tools, or its
+// history, or that same prompt, is the turn.
+func sideCall(req *Request, tr turnRule, had bool, sys string) bool {
+	if req == nil {
+		return false
+	}
+	if knownSide(req) || compacting(req) {
+		return true
+	}
+	return had && unrelatedHelper(req, tr, sys)
+}
+
+// knownSide is a helper magpie already tells from a turn by what it asks:
+// a session title, Claude Code's AgentSummary, a prompt suggestion, or
+// the auto mode classifier.
+func knownSide(req *Request) bool {
+	return titling(req) || agentSummary(req) || promptSuggestion(req) || autoModeClassifier(req)
+}
+
+// agentSummary reports whether req is Claude Code's AgentSummary: the
+// conversation, and a last user line that asks for a few words of progress.
+func agentSummary(req *Request) bool {
+	ask := lastAsk(req)
+	return strings.HasPrefix(ask, "Describe your ") && strings.Contains(ask, " in 3-5 words")
+}
+
+// promptSuggestion reports whether req is Claude Code asking what the user
+// might type next, appended to the transcript as its own user message.
+func promptSuggestion(req *Request) bool {
+	return strings.HasPrefix(lastAsk(req), "[SUGGESTION MODE:")
+}
+
+// lastAsk is the last text of req's last user message, trimmed.
+func lastAsk(req *Request) string {
+	if req == nil {
+		return ""
+	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		m := req.Messages[i]
+		if m.Role != "user" {
+			continue
+		}
+		for j := len(m.Parts) - 1; j >= 0; j-- {
+			if m.Parts[j].Kind == Text {
+				return strings.TrimSpace(m.Parts[j].Text)
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
+// unrelatedHelper is a tool-less one-message call whose system prompt is
+// not the stored turn's. An edit, a rewind or a retry keeps that prompt —
+// the billing line's cch and the reminders change, the prompt does not —
+// or it keeps the conversation's tools and history. A tool-less call that
+// arrived before the turn does not hold a later tool-bearing turn: that
+// turn carries tools, so it is not this.
+func unrelatedHelper(req *Request, tr turnRule, sys string) bool {
+	if len(req.Tools) > 0 || !shortHelper(req) {
+		return false
+	}
+	return sys != tr.sys
+}
+
+// shortHelper is one user message and no reply, and no tool result. A
+// title is that. An edit of a later turn, a rewind and a tool round are not.
+func shortHelper(req *Request) bool {
+	users := 0
+	for _, m := range req.Messages {
+		switch m.Role {
+		case "assistant":
+			return false
+		case "user":
+			users++
+			for _, p := range m.Parts {
+				if p.Kind == ToolResult || p.Kind == ToolCall {
+					return false
+				}
+			}
+		}
+	}
+	return users <= 1
+}
+
+// systemID names req's system prompt with the billing line and the
+// reminders left out. It is a short id, computed once per decision and
+// never while turnRules is held: the prompt is what an edit keeps and a
+// side call replaces, and the conversation itself is not hashed.
+func systemID(req *Request) string {
+	if req == nil {
+		return ""
+	}
+	texts := req.systemTexts()
+	if len(texts) == 0 && req.System != "" {
+		texts = []string{req.System}
+	}
+	h := sha256.New()
+	n := 0
+	for _, t := range texts {
+		t = strings.TrimSpace(reminders.ReplaceAllString(withoutBillingHeader(t), ""))
+		if t == "" {
+			continue
+		}
+		if n > 0 {
+			h.Write([]byte{0})
+		}
+		h.Write([]byte(t))
+		n++
+	}
+	if n == 0 {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+// routingAside reports whether an answer belongs to a side call or a
+// compaction: the group's own hit, or a group inside it. An unruled group
+// has no hit of its own, and a ruled group inside it still must not move
+// the conversation's stick or write the turn's counted size (#7455).
+func routingAside(hit *RuleHit, nested []NestedRule) bool {
+	if hit != nil && (hit.Compact || hit.Aside) {
+		return true
+	}
+	for _, n := range nested {
+		if n.Rule != nil && (n.Rule.Compact || n.Rule.Aside) {
+			return true
+		}
+	}
+	return false
 }
 
 // outgrown is the rule a request within a turn moves by when it no longer
@@ -529,7 +761,7 @@ func keepsEffort(tr turnRule, pick string, tokens int, now time.Time) bool {
 // their own key (at, the group's, and the group's way down), asking ask
 // of the message as the group's own rules do. It gives what each decided
 // and their keys.
-func (s *Server) nestedRules(at string, req *Request, agent string, ask classifier, ms []provider.Member, cands []candidate, pl planned, aff *Affinity, picked string) ([]NestedRule, []string, []candidate, planned) {
+func (s *Server) nestedRules(at string, req *Request, agent string, ask classifier, ms []provider.Member, cands []candidate, pl planned, aff *Affinity, picked string, aside bool) ([]NestedRule, []string, []candidate, planned) {
 	var out []NestedRule
 	var keys []string
 	for depth := 0; ; depth++ { // as deep as the one going first is
@@ -552,9 +784,12 @@ func (s *Server) nestedRules(at string, req *Request, agent string, ask classifi
 		// the outermost pick stands (#4358): a group in the group asked
 		// once one above it has picked only pays for an answer the turn
 		// would throw away
-		h := ruleFor(at, sub, subMs, req, agent, ask, picked)
+		h := ruleForMode(at, sub, subMs, req, agent, ask, picked, aside)
 		keys = append(keys, at)
 		out = append(out, NestedRule{Group: sub.ID, Name: sub.Name, Rule: h})
+		if h != nil && (h.Aside || h.Compact) {
+			aside = true
+		}
 		if h != nil && h.Pick != "" && picked == "" {
 			picked = h.Pick
 		}
