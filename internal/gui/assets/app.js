@@ -24621,8 +24621,11 @@ function noteAccounts(x, depth = 0) {
     if (!Object.hasOwn(x, k)) continue;
     const v = x[k];
     if (typeof v === "string") {
-      // an alias, not the user's own (named, #3656)
-      if (k === "user" || k === "account" || (k === "alias" && !x.named) || (k === "who" && x.kind === "account")) noteAccount(v);
+      // an alias, not the user's own (named, #3656). A model picker's
+      // alias is the undated id of a dated model (its value), not an
+      // account, so auto/<model> stays readable (#7407). An account whose
+      // own name is that id is still hidden: it is a user, account or who.
+      if (k === "user" || k === "account" || (k === "alias" && !x.named && !("value" in x)) || (k === "who" && x.kind === "account")) noteAccount(v);
     } else if (k === "who" && x.kind === "account" && Array.isArray(v)) for (const w of v) noteAccount(w);
     else if (v && typeof v === "object") noteAccounts(v, depth + 1);
   }
