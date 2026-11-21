@@ -41,19 +41,53 @@ const openBotUser = `{
 }
 `
 
+// openBotModelDoc is one model as OpenBot's modelSchema reads it. A nil
+// pointer is a field left out. For inputs and reasoningEfforts that is
+// not the same as []: an empty list is text-only and no reasoning effort,
+// and a missing one is OpenCode's default.
+type openBotModelDoc struct {
+	ID               *string   `json:"id"`
+	Name             *string   `json:"name"`
+	ContextWindow    *int      `json:"contextWindow"`
+	MaxOutput        *int      `json:"maxOutput"`
+	ReasoningEfforts *[]string `json:"reasoningEfforts"`
+	Inputs           *[]string `json:"inputs"`
+}
+
+// openBotSpecEfforts and openBotSpecInputs are the only orders OpenBot's
+// isCustomProviderModel accepts (on disk, modelSchema drops an invalid
+// field via .catch(undefined), and IPC validation rejects it). They are
+// the check's own copy of that schema, not the lists the writer uses.
+var openBotSpecEfforts = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+var openBotSpecInputs = []string{"image", "pdf"}
+
 // openBotEntryDoc is a providers entry with OpenBot's fields alone
 // (entrySchema), so a field of magpie's own fails to decode.
 type openBotEntryDoc struct {
-	ID      *string `json:"id"`
-	Name    *string `json:"name"`
-	BaseURL *string `json:"baseUrl"`
-	Models  *[]struct {
-		ID            *string `json:"id"`
-		Name          *string `json:"name"`
-		ContextWindow *int    `json:"contextWindow"`
-	} `json:"models"`
-	Secret  *string `json:"secret"`
-	Harness *string `json:"harness"`
+	ID      *string            `json:"id"`
+	Name    *string            `json:"name"`
+	BaseURL *string            `json:"baseUrl"`
+	Models  *[]openBotModelDoc `json:"models"`
+	Secret  *string            `json:"secret"`
+	Harness *string            `json:"harness"`
+}
+
+// openBotOrdered reports whether got is a strictly ordered subset of
+// order: each value one of order's, once, and only in order's order.
+// nil is left out, which is allowed.
+func openBotOrdered(got *[]string, order []string) bool {
+	if got == nil {
+		return true
+	}
+	at := -1
+	for _, g := range *got {
+		i := slices.Index(order, g)
+		if i <= at {
+			return false
+		}
+		at = i
+	}
+	return true
 }
 
 // openBotAgentModel is isAgentModel (ipc-agent-identity.ts): what a
@@ -63,8 +97,10 @@ var openBotAgentModel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/\[\],=-]*$
 // openBotRead is the file's magpie entry, checked as OpenBot reads one
 // (fileSchema, then isCustomProviderSummary, which fails closed on the
 // whole list): version 1, the required fields there and nothing else, at
-// most 64 models with ids and names it takes and windows in its range;
-// and the user's entries, as written.
+// most 64 models with ids and names it takes, windows in its range, a
+// maxOutput only from 256 to 1,000,000, and inputs and reasoningEfforts
+// each a strictly ordered subset of the kinds OpenBot names (or left
+// out); and the user's entries, as written.
 func openBotRead(t *testing.T, path string) (magpie openBotEntryDoc, others []json.RawMessage) {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -120,8 +156,76 @@ func openBotRead(t *testing.T, path string) (magpie openBotEntryDoc, others []js
 		if w := m.ContextWindow; w != nil && (*w < 1024 || *w > 100_000_000) {
 			t.Errorf("%s: window %d", *m.ID, *w)
 		}
+		if o := m.MaxOutput; o != nil && (*o < 256 || *o > 1_000_000) {
+			t.Errorf("%s: maxOutput %d", *m.ID, *o)
+		}
+		if !openBotOrdered(m.ReasoningEfforts, openBotSpecEfforts) {
+			t.Errorf("%s: reasoningEfforts %v", *m.ID, *m.ReasoningEfforts)
+		}
+		if !openBotOrdered(m.Inputs, openBotSpecInputs) {
+			t.Errorf("%s: inputs %v", *m.ID, *m.Inputs)
+		}
 	}
 	return magpie, others
+}
+
+// openBotListed is the model id in e.
+func openBotListed(t *testing.T, e openBotEntryDoc, id string) openBotModelDoc {
+	t.Helper()
+	for _, m := range *e.Models {
+		if m.ID != nil && *m.ID == id {
+			return m
+		}
+	}
+	t.Fatalf("model %s not listed", id)
+	return openBotModelDoc{}
+}
+
+// openBotRawModel is the model object as written, so a field left out
+// (no key) can be told from null or [].
+func openBotRawModel(t *testing.T, path, id string) map[string]json.RawMessage {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Providers []json.RawMessage `json:"providers"`
+	}
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range doc.Providers {
+		if g := jsonID(raw); g != magpieID {
+			continue
+		}
+		var e struct {
+			Models []json.RawMessage `json:"models"`
+		}
+		if err := json.Unmarshal(raw, &e); err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range e.Models {
+			if jsonID(m) != id {
+				continue
+			}
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(m, &obj); err != nil {
+				t.Fatal(err)
+			}
+			return obj
+		}
+	}
+	t.Fatalf("model %s not in %s", id, b)
+	return nil
+}
+
+func jsonID(raw json.RawMessage) string {
+	var o struct {
+		ID string `json:"id"`
+	}
+	json.Unmarshal(raw, &o)
+	return o.ID
 }
 
 // OpenBot (nightly-labs/openbot) lists the user's own endpoints in its
@@ -339,6 +443,330 @@ func TestOpenBotModelsItTakes(t *testing.T) {
 		if m.ContextWindow != 0 && (m.ContextWindow < 1024 || m.ContextWindow > 100_000_000) {
 			t.Errorf("%s: window %d", m.ID, m.ContextWindow)
 		}
+	}
+}
+
+// OpenBot shows an upload and a thinking control from inputs and
+// reasoningEfforts. The fields are the ones its own check takes, in its
+// order, or the whole list is empty: inputs an ordered subset of image
+// then pdf, or []; reasoningEfforts an ordered subset of none, minimal,
+// low, medium, high, xhigh, max, or []; maxOutput an integer from 256 to
+// 1,000,000 and strictly below the context window. A known text-only
+// model writes inputs [], and a model that does not think, or whose
+// levels OpenBot does not name, writes reasoningEfforts []. A model that
+// thinks and has no levels omits reasoningEfforts, and nothing said of
+// the input omits inputs. An output outside the range, or not below the
+// window, is omitted. A sync writes nothing while they are unchanged,
+// and writes again when they change.
+func TestOpenBotModelsCarryCapabilities(t *testing.T) {
+	home := syncHome(t)
+	was := provider.Described
+	provider.Described = func() bool { return false }
+	t.Cleanup(func() { provider.Described = was })
+	const base = "https://ob.example/v1"
+	ids := []string{"both", "lo", "hi", "under", "over", "plain", "odd", "switch", "unsaid", "noimg"}
+	if err := provider.Save(provider.Provider{ID: "ob", Name: "OB", Chat: base, Key: "k", Models: ids}); err != nil {
+		t.Fatal(err)
+	}
+	no := false
+	if err := provider.SetModelImage("ob/noimg", &no); err != nil {
+		t.Fatal(err)
+	}
+	ms := []catalog.Model{
+		{ID: "both", Name: "Both", Context: 200000, Output: 128000, Images: true,
+			InputModalities: []string{"pdf", "text", "image"},
+			Efforts:         []string{"max", "ultra", "LOW", "low", "none", "persistent", "High", "minimal", "xhigh", "medium", "extra_high"}},
+		{ID: "lo", Name: "Lo", Context: 8192, Output: 256, Images: true, InputModalities: []string{"text", "image"}},
+		// 1,000,000 is the top of the range, and only while it is below the window
+		{ID: "hi", Name: "Hi", Context: 2_000_000, Output: 1_000_000, InputModalities: []string{"text", "pdf"}},
+		{ID: "under", Name: "Under", Context: 512, Output: 255, Efforts: []string{"high"}, InputModalities: []string{"text"}},
+		{ID: "over", Name: "Over", Context: 8192, Output: 1_000_001, Images: true, InputModalities: []string{"text"}},
+		{ID: "plain", Name: "Plain", InputModalities: []string{"text"}},
+		{ID: "odd", Name: "Odd", Output: 100, Efforts: []string{"light", "ULTRA", "persistent", "LIGHT"}, InputModalities: []string{"text"}},
+		// thinks, and has no levels: reasoningEfforts left out, inputs known text
+		{ID: "switch", Name: "Switch", Reasoning: true, InputModalities: []string{"text"}},
+		// nothing said of input or reasoning
+		{ID: "unsaid", Name: "Unsaid"},
+		// bare model marked text-only via provider.SetModelImage(..., &false)
+		{ID: "noimg", Name: "NoImg"},
+	}
+	if err := catalog.SaveLive("ob", base, ms); err != nil {
+		t.Fatal(err)
+	}
+	a := openBot(home, filepath.Join(home, ".config"))
+	if err := a.Field("provider").Set(magpieID); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := openBotRead(t, a.Path)
+	want := map[string]struct {
+		in, eff       []string
+		inSet, effSet bool
+		out           int
+		outSet        bool
+	}{
+		"ob/both":   {[]string{"image", "pdf"}, []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"}, true, true, 128000, true},
+		"ob/lo":     {[]string{"image"}, nil, true, true, 256, true},
+		"ob/hi":     {[]string{"pdf"}, nil, true, true, 1_000_000, true},
+		"ob/under":  {nil, []string{"high"}, true, true, 0, false},
+		"ob/over":   {[]string{"image"}, nil, true, true, 0, false},
+		"ob/plain":  {nil, nil, true, true, 0, false},
+		"ob/odd":    {nil, nil, true, true, 0, false},
+		"ob/switch": {nil, nil, true, false, 0, false},
+		"ob/unsaid": {nil, nil, false, true, 0, false},
+		"ob/noimg":  {nil, nil, true, true, 0, false},
+	}
+	// syncHome also lists relay/glm-4.6; the models under test are ob's
+	for id, w := range want {
+		m := openBotListed(t, e, id)
+		if w.inSet != (m.Inputs != nil) || !slices.Equal(ptrStrings(m.Inputs), w.in) {
+			t.Errorf("%s inputs %v (set %v), want %v (set %v)", id, ptrStrings(m.Inputs), m.Inputs != nil, w.in, w.inSet)
+		}
+		if w.effSet != (m.ReasoningEfforts != nil) || !slices.Equal(ptrStrings(m.ReasoningEfforts), w.eff) {
+			t.Errorf("%s reasoningEfforts %v (set %v), want %v (set %v)", id, ptrStrings(m.ReasoningEfforts), m.ReasoningEfforts != nil, w.eff, w.effSet)
+		}
+		switch {
+		case w.outSet && (m.MaxOutput == nil || *m.MaxOutput != w.out):
+			t.Errorf("%s maxOutput %v, want %d", id, m.MaxOutput, w.out)
+		case !w.outSet && m.MaxOutput != nil:
+			t.Errorf("%s maxOutput %d, want it left out", id, *m.MaxOutput)
+		}
+	}
+	// [] is the two-character list, not left out and not null. A missing
+	// inputs is image on, and a missing reasoningEfforts is low, medium
+	// and high.
+	for id, w := range want {
+		raw := openBotRawModel(t, a.Path, id)
+		if w.inSet && len(w.in) == 0 && !rawEmptyList(raw["inputs"]) {
+			t.Errorf("%s inputs %s, want []", id, raw["inputs"])
+		}
+		if !w.inSet && raw["inputs"] != nil {
+			t.Errorf("%s inputs %s, want it left out", id, raw["inputs"])
+		}
+		if w.effSet && len(w.eff) == 0 && !rawEmptyList(raw["reasoningEfforts"]) {
+			t.Errorf("%s reasoningEfforts %s, want []", id, raw["reasoningEfforts"])
+		}
+		if !w.effSet && raw["reasoningEfforts"] != nil {
+			t.Errorf("%s reasoningEfforts %s, want it left out", id, raw["reasoningEfforts"])
+		}
+		if !w.outSet && raw["maxOutput"] != nil {
+			t.Errorf("%s maxOutput %s, want it left out", id, raw["maxOutput"])
+		}
+	}
+	if raw := openBotRawModel(t, a.Path, "ob/under"); raw["contextWindow"] != nil {
+		t.Errorf("under window %s", raw["contextWindow"])
+	}
+
+	b, _ := os.ReadFile(a.Path)
+	st, _ := os.Stat(a.Path)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if b2, _ := os.ReadFile(a.Path); !bytes.Equal(b, b2) {
+		t.Errorf("sync wrote with nothing changed:\n%s\n%s", b, b2)
+	}
+	if st2, _ := os.Stat(a.Path); !st2.ModTime().Equal(st.ModTime()) {
+		t.Error("sync touched the file with nothing changed")
+	}
+
+	// the plain model learns images, a level, a window and an output inside
+	// it: the next sync writes those, and only then. The output needs the
+	// window, or maxOutput stays omitted.
+	for i := range ms {
+		if ms[i].ID == "plain" {
+			ms[i].Images = true
+			ms[i].InputModalities = []string{"text", "image", "pdf"}
+			ms[i].Efforts = []string{"high", "low", "high"}
+			ms[i].Context = 128000
+			ms[i].Output = 4096
+		}
+	}
+	if err := catalog.SaveLive("ob", base, ms); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	e, _ = openBotRead(t, a.Path)
+	m := openBotListed(t, e, "ob/plain")
+	if !slices.Equal(ptrStrings(m.Inputs), []string{"image", "pdf"}) || !slices.Equal(ptrStrings(m.ReasoningEfforts), []string{"low", "high"}) || m.MaxOutput == nil || *m.MaxOutput != 4096 {
+		t.Errorf("plain after the change: inputs %v efforts %v maxOutput %v", ptrStrings(m.Inputs), ptrStrings(m.ReasoningEfforts), m.MaxOutput)
+	}
+	if !slices.Equal(ptrStrings(openBotListed(t, e, "ob/both").Inputs), []string{"image", "pdf"}) {
+		t.Error("both lost its inputs when plain changed")
+	}
+}
+
+// A model that can't see is still told it takes images when Vision
+// describes them (provider.Described): told it doesn't, OpenBot turns the
+// picture away before the gateway is asked. A pdf its source lists stays
+// after image.
+func TestOpenBotImageWhenVisionDescribes(t *testing.T) {
+	home := syncHome(t)
+	was := provider.Described
+	provider.Described = func() bool { return true }
+	t.Cleanup(func() { provider.Described = was })
+	const base = "https://ob-see.example/v1"
+	if err := provider.Save(provider.Provider{ID: "obsee", Name: "See", Chat: base, Key: "k", Models: []string{"words", "paper"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveLive("obsee", base, []catalog.Model{
+		{ID: "words", Name: "Words", InputModalities: []string{"text"}},
+		{ID: "paper", Name: "Paper", InputModalities: []string{"text", "pdf"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a := openBot(home, filepath.Join(home, ".config"))
+	if err := a.Field("provider").Set(magpieID); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := openBotRead(t, a.Path)
+	if got := ptrStrings(openBotListed(t, e, "obsee/words").Inputs); !slices.Equal(got, []string{"image"}) {
+		t.Errorf("words inputs %v, want [image]", got)
+	}
+	if got := ptrStrings(openBotListed(t, e, "obsee/paper").Inputs); !slices.Equal(got, []string{"image", "pdf"}) {
+		t.Errorf("paper inputs %v, want [image pdf]", got)
+	}
+}
+
+func ptrStrings(p *[]string) []string {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// rawEmptyList reports whether v is the JSON list [], not null and not
+// a missing key.
+func rawEmptyList(v json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(v), []byte("[]"))
+}
+
+func sameStringList(got, want *[]string) bool {
+	if (got == nil) != (want == nil) {
+		return false
+	}
+	return slices.Equal(ptrStrings(got), ptrStrings(want))
+}
+
+// image follows Images, including on a raw catalog.Model whose source
+// listed image. A known text-only model is [], and nothing said of the
+// input is left out.
+func TestOpenBotInputsFollowImages(t *testing.T) {
+	no, yes := false, true
+	for _, c := range []struct {
+		name string
+		m    catalog.Model
+		want *[]string
+	}{
+		{"source listed image, Images false", catalog.Model{InputModalities: []string{"text", "image", "pdf"}}, &[]string{"pdf"}},
+		{"image then pdf", catalog.Model{Images: true, InputModalities: []string{"pdf", "image"}}, &[]string{"image", "pdf"}},
+		{"known text", catalog.Model{InputModalities: []string{"text"}}, openBotEmpty()},
+		{"explicit image no", catalog.Model{ImageInput: &no}, openBotEmpty()},
+		{"explicit image yes, Images false", catalog.Model{ImageInput: &yes}, openBotEmpty()},
+		{"images, no list", catalog.Model{Images: true}, &[]string{"image"}},
+		{"unsaid", catalog.Model{}, nil},
+	} {
+		if got := openBotInputs(c.m); !sameStringList(got, c.want) {
+			t.Errorf("%s: %v, want %v", c.name, ptrStrings(got), ptrStrings(c.want))
+		}
+	}
+}
+
+// reasoningEfforts [] is no effort. A model that thinks and has no levels
+// omits the field, so OpenCode offers low, medium and high. Levels OpenBot
+// cannot name are [], not omitted: omitting would offer levels the model
+// has not.
+func TestOpenBotEffortField(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		m    catalog.Model
+		want *[]string
+	}{
+		{"plain", catalog.Model{}, openBotEmpty()},
+		{"thinks, no levels", catalog.Model{Reasoning: true}, nil},
+		{"named levels", catalog.Model{Reasoning: true, Efforts: []string{"HIGH", "low", "low"}}, &[]string{"low", "high"}},
+		{"only levels OpenBot refuses", catalog.Model{Reasoning: true, Efforts: []string{"ultra", "light"}}, openBotEmpty()},
+		{"levels, reasoning flag off", catalog.Model{Efforts: []string{"none", "max"}}, &[]string{"none", "max"}},
+	} {
+		if got := openBotEffortField(c.m); !sameStringList(got, c.want) {
+			t.Errorf("%s: %v, want %v", c.name, ptrStrings(got), ptrStrings(c.want))
+		}
+	}
+}
+
+// SetModelReasonless clears the levels and the thinking flag. The file
+// then says reasoningEfforts [], so OpenCode sends no reasoning_effort.
+func TestOpenBotReasonlessWritesNoEfforts(t *testing.T) {
+	home := syncHome(t)
+	const base = "https://ob-off.example/v1"
+	if err := provider.Save(provider.Provider{ID: "oboff", Name: "Off", Chat: base, Key: "k", Models: []string{"thinks"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveLive("oboff", base, []catalog.Model{
+		{ID: "thinks", Name: "Thinks", Efforts: []string{"high", "low"}, Reasoning: true, InputModalities: []string{"text"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SetModelReasonless("oboff/thinks", true); err != nil {
+		t.Fatal(err)
+	}
+	a := openBot(home, filepath.Join(home, ".config"))
+	if err := a.Field("provider").Set(magpieID); err != nil {
+		t.Fatal(err)
+	}
+	raw := openBotRawModel(t, a.Path, "oboff/thinks")
+	if !rawEmptyList(raw["reasoningEfforts"]) || !rawEmptyList(raw["inputs"]) {
+		t.Errorf("reasonless: %s", raw)
+	}
+}
+
+// maxOutput is written only inside 256 to 1,000,000 and strictly below a
+// context window OpenBot accepts. A wider output, an equal one, and one
+// beside a window of 0 or under 1,024 are left out.
+func TestOpenBotMaxOutputStaysInsideTheWindow(t *testing.T) {
+	home := syncHome(t)
+	const base = "https://ob-out.example/v1"
+	ids := []string{"roomless", "nowindow", "wider", "equal", "fits"}
+	if err := provider.Save(provider.Provider{ID: "obout", Name: "Out", Chat: base, Key: "k", Models: ids}); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveLive("obout", base, []catalog.Model{
+		{ID: "roomless", Name: "Roomless", Context: 512, Output: 4096},
+		{ID: "nowindow", Name: "No window", Context: 0, Output: 4096},
+		{ID: "wider", Name: "Wider", Context: 128000, Output: 384000},
+		{ID: "equal", Name: "Equal", Context: 4096, Output: 4096},
+		{ID: "fits", Name: "Fits", Context: 128000, Output: 16384},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a := openBot(home, filepath.Join(home, ".config"))
+	if err := a.Field("provider").Set(magpieID); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := openBotRead(t, a.Path)
+	for _, id := range []string{"obout/roomless", "obout/nowindow", "obout/wider", "obout/equal"} {
+		m := openBotListed(t, e, id)
+		if m.MaxOutput != nil {
+			t.Errorf("%s maxOutput %d, want it left out", id, *m.MaxOutput)
+		}
+		if raw := openBotRawModel(t, a.Path, id); raw["maxOutput"] != nil {
+			t.Errorf("%s wrote maxOutput %s", id, raw["maxOutput"])
+		}
+	}
+	if m := openBotListed(t, e, "obout/roomless"); m.ContextWindow != nil {
+		t.Errorf("roomless window %d, want it left out", *m.ContextWindow)
+	}
+	if m := openBotListed(t, e, "obout/nowindow"); m.ContextWindow != nil {
+		t.Errorf("nowindow window %d", *m.ContextWindow)
+	}
+	for _, id := range []string{"obout/wider", "obout/equal"} {
+		if m := openBotListed(t, e, id); m.ContextWindow == nil {
+			t.Errorf("%s context window left out", id)
+		}
+	}
+	m := openBotListed(t, e, "obout/fits")
+	if m.ContextWindow == nil || *m.ContextWindow != 128000 || m.MaxOutput == nil || *m.MaxOutput != 16384 {
+		t.Errorf("fits window %v maxOutput %v", m.ContextWindow, m.MaxOutput)
 	}
 }
 
