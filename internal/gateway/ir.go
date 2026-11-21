@@ -417,7 +417,7 @@ type Request struct {
 	// OffLevel is the level such an API is asked to think at when the
 	// client turned reasoning off: Gemini 3 can't stop thinking, and thinks
 	// least at minimal, or at its lowest level where it has no minimal or
-	// turned minimal away (geminiLevels). "" is minimal.
+	// turned minimal away (geminiCompatLevels). "" is minimal.
 	OffLevel string
 	// Resume is set on a request built to go on with a reply the client
 	// already has part of (continuation.go): its last message is that
@@ -448,6 +448,15 @@ type Request struct {
 	// fields are, by the tool's name: sent to it as JSON text, they
 	// reach the client read back (gemini_free_objects.go, #7363).
 	Free map[string][][]string
+	// geminiAs is the model id generation and thinking levels are read
+	// from when SetModelID or SetUpstreamName sends another name than
+	// the one magpie lists. "" is that listed id.
+	geminiAs string
+	// geminiEfforts, when geminiEffortsSet, are the levels xhigh is
+	// gated on for that upstream model: the provider's, else the
+	// catalog's, else none (an unlisted Gemini 4 stays at high).
+	geminiEfforts    []string
+	geminiEffortsSet bool
 }
 
 // nsTool is a tool as a Responses client knows it: by its namespace and its
@@ -1155,7 +1164,7 @@ func fitEffort(want string, levels []string) string {
 // budgetOf is the Anthropic thinking budget for an effort level.
 func budgetOf(effort string) int {
 	switch effort {
-	case "low":
+	case "minimal", "low":
 		return 4096
 	case "medium":
 		return 10000

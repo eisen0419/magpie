@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -23,6 +25,15 @@ import (
 // (which Google won't take with them); one that turned thinking off gets the
 // least Gemini thinks; other hosts are asked as before.
 func TestAIStudioThinking(t *testing.T) {
+	fresh(t)
+	if err := os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(catalog.CachePath(), []byte(geminiXHighCatalog), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
 	type want struct {
 		effort string // reasoning_effort, "" for none
 		config string // extra_body.google.thinking_config as JSON, "" for none
@@ -34,6 +45,12 @@ func TestAIStudioThinking(t *testing.T) {
 	}{
 		{"high", aiStudioHost, "gemini-3.8-flash", Request{GeminiCompat: true, Thinking: true, Effort: "high"}, want{"", `{"include_thoughts":true,"thinking_level":"high"}`}},
 		{"xhigh", aiStudioHost, "gemini-3.8-flash", Request{GeminiCompat: true, Thinking: true, Effort: "xhigh"}, want{"", `{"include_thoughts":true,"thinking_level":"high"}`}},
+		// Gemini 4 keeps xhigh (and clamps max to xhigh) when the model lists
+		// xhigh; Argon, Gemini 3, and an unlisted Gemini 4 stay at high (#7400).
+		{"xhigh on gemini 4", aiStudioHost, "gemini-4-hydrogen", Request{GeminiCompat: true, Thinking: true, Effort: "xhigh"}, want{"", `{"include_thoughts":true,"thinking_level":"xhigh"}`}},
+		{"max on gemini 4", aiStudioHost, "gemini-4-hydrogen", Request{GeminiCompat: true, Thinking: true, Effort: "max"}, want{"", `{"include_thoughts":true,"thinking_level":"xhigh"}`}},
+		{"max on gemini 4 argon", aiStudioHost, "gemini-4-argon", Request{GeminiCompat: true, Thinking: true, Effort: "max"}, want{"", `{"include_thoughts":true,"thinking_level":"high"}`}},
+		{"xhigh on an unlisted gemini 4", aiStudioHost, "gemini-4-quartz", Request{GeminiCompat: true, Thinking: true, Effort: "xhigh"}, want{"", `{"include_thoughts":true,"thinking_level":"high"}`}},
 		{"low", aiStudioHost, "gemini-3.1-pro", Request{GeminiCompat: true, Thinking: true, Effort: "low"}, want{"", `{"include_thoughts":true,"thinking_level":"low"}`}},
 		{"2.5 budget", aiStudioHost, "gemini-2.5-flash", Request{GeminiCompat: true, Thinking: true, Effort: "medium"}, want{"", `{"include_thoughts":true,"thinking_budget":8192}`}},
 		{"no effort", aiStudioHost, "gemini-3.8-flash", Request{GeminiCompat: true, Thinking: true}, want{"", `{"include_thoughts":true}`}},
@@ -286,6 +303,8 @@ func TestGeminiRefusedLevel(t *testing.T) {
 	for _, c := range []struct{ body, want string }{
 		{aiStudioRefusal("minimal"), "minimal"},
 		{aiStudioRefusal("medium"), "medium"},
+		{aiStudioRefusal("xhigh"), "xhigh"},
+		{`{"error":{"code":400,"message":"Thinking level is unsupported: THINKING_LEVEL_XHIGH","status":"INVALID_ARGUMENT"}}`, "xhigh"},
 		{vertexRefusal, "minimal"},
 		// gemini-3.1-pro-preview's message for thinking_level minimal at
 		// Vertex AI, as captured 2026-10-06 up to its "Learn more" link

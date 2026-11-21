@@ -25,7 +25,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/usage"
 )
@@ -723,6 +722,17 @@ func withEffort(proto provider.Protocol, body []byte, effort string) []byte {
 			}
 			return withFields(body, fields)
 		}
+	case provider.Gemini:
+		// a group or a turn fitting the level rewrites thinkingLevel and
+		// leaves the rest of thinkingConfig as the client sent it. none,
+		// and a body that names no level, stay as the client sent them,
+		// as Chat, Responses and Anthropic do. withBodyEffort still
+		// rewrites none to low when a refusal asked for that (#7400).
+		level, ok := geminiWireLevel(body)
+		if !ok || strings.EqualFold(level, "none") {
+			return body
+		}
+		return withGeminiThinkingLevel(body, effort)
 	}
 	return body
 }
@@ -1012,20 +1022,13 @@ func withGeminiEffortFor(body []byte, model, effort string, efforts []string) []
 				level = "low"
 			}
 		case at > slices.Index(effortRank, "high"):
-			// above high only where the provider or catalog lists such a
-			// level: Gemini 4 Hydrogen takes xhigh, every Gemini before it
-			// high at most
-			fit := "high"
-			ls := efforts
-			if len(ls) == 0 {
-				ls = catalog.EffortsOf(m)
+			// above high only where the provider or catalog lists xhigh on
+			// Gemini 4 or later: Hydrogen takes xhigh, every Gemini before
+			// 4 stays at high, and max/ultra never reach the wire (#7400).
+			level = "high"
+			if geminiAllowsXHigh(m, efforts) {
+				level = "xhigh"
 			}
-			if len(ls) > 0 {
-				if l := catalog.NearestEffort(level, ls); slices.Index(effortRank, l) > slices.Index(effortRank, "high") {
-					fit = l
-				}
-			}
-			level = fit
 		}
 		tc["thinkingLevel"] = level
 	case level == "none":

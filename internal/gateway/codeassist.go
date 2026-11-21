@@ -17,6 +17,7 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // ---- Google Code Assist (provider side) --------------------------------------
@@ -502,11 +503,94 @@ func codeAssistID(model, effort, agent string) string {
 // in force is looked up against the very id the envelope is addressed to:
 // asking twice reads the vendor's catalogue twice over for one answer.
 func codeAssistBody(p provider.Provider, r *Request, model string, wires map[string]string) []byte {
+	return codeAssistBodyAt(context.Background(), p, r, model, wires)
+}
+
+func codeAssistBodyAt(ctx context.Context, p provider.Provider, r *Request, model string, wires map[string]string) []byte {
 	// a model the user lists by an id of theirs (SetModelID) is the
 	// account's own model: its envelope, the variant the effort picks and
-	// a name for the whole provider are of the vendor's id
-	model = p.OwnModelID(model)
-	sent := codeAssistID(model, r.Effort, p.Account.Agent)
+	// a name for the whole provider are of the vendor's id. Wires() also
+	// stores that listing, and a provider "*" already applied to it, under
+	// the listed id. That entry is not a SetUpstreamName: reading it as
+	// one sent the family's bare id (flash-9) where the effort had picked
+	// flash-9-low (#7400).
+	listed := model
+	own := ownModelIDAt(ctx, p, listed)
+	effort := ""
+	if r != nil {
+		effort = r.Effort
+	}
+	// an opaque vendor id is only the name on the wire. Generation and
+	// the thinking level stay on the model magpie lists: ep-123 is not a
+	// Gemini generation, so shaping from it sent a 2.x budget (#7400).
+	shapeFrom := own
+	if !modelIdentified(own) && modelIdentified(listed) {
+		shapeFrom = listed
+	}
+	sent := codeAssistID(shapeFrom, effort, p.Account.Agent)
+	// the name the envelope's model field carries, and the id thinking
+	// is shaped from. A specific upstream name (SetUpstreamName) is both:
+	// building the variant first and only then rewriting the model field
+	// sent gemini-4-hydrogen's xhigh to an argon the rename points at
+	// (#7400). A provider-wide "*" still only rewrites the field, once.
+	wire, shape := sent, sent
+	if shapeFrom != own {
+		wire = own
+	}
+	renamed := false
+	wrappedFrom := ""
+	// a rename that is itself opaque stays the name on the wire. Shape
+	// keeps the model magpie knows.
+	take := func(w string) {
+		wire, renamed = w, true
+		if modelIdentified(w) {
+			shape = w
+		}
+	}
+	if w, ok := specificUpstreamAt(ctx, wires, p, listed); ok {
+		take(w)
+	} else if own != listed {
+		if w, ok := specificUpstreamAt(ctx, wires, p, own); ok {
+			take(w)
+		}
+	}
+	if !renamed {
+		// the same "*" wildcardWireAt applies, including one that lives
+		// only in the settings when wires is nil (#7400)
+		pattern := ""
+		if wires != nil {
+			pattern = strings.TrimSpace(wires[p.ID+"/*"])
+		}
+		if pattern == "" {
+			pattern = providerStarAt(ctx, p.ID)
+		}
+		starAt := sent
+		if shapeFrom != own {
+			starAt = own
+		}
+		if w := wildcardWireAt(ctx, wires, p.ID, starAt); w != "" && w != starAt {
+			wire = w
+			// the "*" already named the field, including an effort
+			// variant (hydrogen-low → gemini-4-hydrogen-low). geminiAs
+			// is the canonical model and must not drop that variant.
+			renamed = true
+			// a "*" whose target names one model (no "*" of its own), or a
+			// wrapping "*" that turns an unidentified alias into a recognized
+			// model (gem/* → gemini-4-* on hydrogen), is shaped from w (#7400).
+			if modelIdentified(w) && ((pattern != "" && !strings.Contains(pattern, "*")) || !modelIdentified(shape)) {
+				if strings.Contains(pattern, "*") {
+					wrappedFrom = shape
+				}
+				shape = w
+			}
+		}
+	}
+	// geminiAs is the canonical model levels were fitted to. The family's
+	// own id is not a rename of the variant the effort picked, and a "*"
+	// wire is already the field: neither is replaced by it.
+	if r != nil && r.geminiAs != "" && !renamed && r.geminiAs != own && r.geminiAs != listed && r.geminiAs != sent {
+		shape, wire = r.geminiAs, r.geminiAs
+	}
 	if p.Account.Agent == "antigravity" && !p.PromptAsWritten {
 		// the lines Google turns away, and the paragraphs
 		// it answers badly, reworded; the request the
@@ -523,8 +607,8 @@ func codeAssistBody(p provider.Provider, r *Request, model string, wires map[str
 			r = &rc
 		}
 	}
-	body := buildCodeAssistSent(r, sent, p.Account.Agent)
-	if wire := provider.UpstreamNameAsIn(wires, p.ID, model, sent); wire != sent {
+	body := buildCodeAssistSentAt(r, shape, p.Account.Agent, wrappedFrom)
+	if wire != shape {
 		body = rewriteModel(body, wire)
 	}
 	return body
@@ -545,6 +629,10 @@ func buildCodeAssist(r *Request, model, agent string) []byte {
 // the request goes out under is the one everything below is shaped from.
 // agent "vertex" is Vertex AI's request (buildVertex).
 func buildCodeAssistSent(r *Request, sent, agent string) []byte {
+	return buildCodeAssistSentAt(r, sent, agent, "")
+}
+
+func buildCodeAssistSentAt(r *Request, sent, agent, wrappedFrom string) []byte {
 	r = responseInstructions(r)
 	ag := agent == "antigravity"
 	vx := agent == "vertex"
@@ -552,6 +640,10 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 	if ag {
 		if _, l, ok := antigravityBaseOf(sent); ok {
 			at = l
+		} else if wrappedFrom != "" {
+			if _, l, ok := antigravityBaseOf(wrappedFrom); ok {
+				at = l
+			}
 		}
 	}
 	claude := strings.Contains(strings.ToLower(sent), "claude")
@@ -996,7 +1088,9 @@ func pairFunctionTurns(contents []map[string]any, ag, agClaude bool) []map[strin
 // Gemini 3's levels: medium goes as medium to Flash, and up to high to
 // Pro, which took low and high only (3 Pro). A later Gemini is sent the
 // medium it was asked, already fitted to its own levels (fitFor):
-// gemini-4-argon has low, medium and high (#2083). Minimal goes only to a
+// gemini-4-argon has low, medium and high (#2083). xhigh goes as xhigh
+// on Gemini 4, which Hydrogen and Neon list; Gemini 3 has none, so it
+// stays at high (#7400). Minimal goes only to a
 // Flash variant at minimal: 3.7 and 3.8 Flash have none (AI Studio
 // answers 3.8's with a 400), and the id here doesn't say which Flash serves it (Gemini
 // CLI's 3.5 Flash goes out as 3.8 Flash where that is rolled out).
@@ -1032,9 +1126,14 @@ func thinkingConfig(r *Request, model string, claude bool, at string) map[string
 			case effort == "medium" && (strings.Contains(m, "flash") || gen > 3):
 				level = "medium"
 			}
-			// a variant at xhigh (Gemini 4 Hydrogen) is asked at xhigh, which
-			// Google lists for it; a model with no such variant stays at high
-			if at == "xhigh" {
+			// xhigh is a Gemini 4 level, and only where this model lists
+			// it (allowsXHigh): an unlisted gemini-4-* stays at high,
+			// as vertexEffort and geminiLevelForEfforts do. Gemini 3
+			// stays at high. A model whose own levels stop at high was
+			// fitted down before this (fitFor). An Antigravity variant
+			// id at xhigh overwrites effort above, and is the same ask
+			// — the id is the listing.
+			if geminiAboveHigh(effort) && gen >= 4 && (at == "xhigh" || r.allowsXHigh(m)) {
 				level = "xhigh"
 			}
 			tc["thinkingLevel"] = level
@@ -1070,6 +1169,290 @@ var geminiVersion = lazyre.New(`(?:^|/)gemini-(\d+)`)
 // told a thinking level; Gemini 4 turns a budget away with "Thinking
 // budget is not supported for this model. Use thinking level instead."
 // (#2083), so a new generation isn't sent one either.
+// geminiAboveHigh reports whether level sits above high in effortRank
+// (xhigh, max, ultra). Gemini only ever takes xhigh above high, and only on
+// Gemini 4 or later when the model lists it (#7400).
+func geminiAboveHigh(level string) bool {
+	return slices.Index(effortRank, strings.ToLower(strings.TrimSpace(level))) > slices.Index(effortRank, "high")
+}
+
+// geminiAllowsXHigh reports whether model is sent thinkingLevel xhigh:
+// Gemini 4 or later, and only when efforts — the provider's, else the
+// catalog's — list xhigh. Unknown models (no levels at all) stay at high.
+func geminiAllowsXHigh(model string, efforts []string) bool {
+	if geminiGeneration(strings.ToLower(model)) < 4 {
+		return false
+	}
+	ls := efforts
+	if len(ls) == 0 {
+		ls = catalog.EffortsOf(model)
+	}
+	return slices.Contains(ls, "xhigh")
+}
+
+// allowsXHigh is geminiAllowsXHigh for a request whose upstream levels were
+// resolved (geminiEffortsSet). Without that, the catalog of model decides,
+// which is what a body built on its own (buildCodeAssist) reads.
+func (r *Request) allowsXHigh(model string) bool {
+	if r != nil && r.geminiEffortsSet {
+		return geminiGeneration(strings.ToLower(model)) >= 4 && slices.Contains(r.geminiEfforts, "xhigh")
+	}
+	return geminiAllowsXHigh(model, nil)
+}
+
+// specificUpstream is the SetUpstreamName on this exact model, not a
+// provider-wide "*" and not the SetModelID Wires() writes under the same
+// key. ok is false when the user gave this model no name of its own. A
+// "*" in the name is the model, as UpstreamNameAsIn replaces it for a
+// name given to the model itself.
+func specificUpstream(wires map[string]string, p provider.Provider, model string) (string, bool) {
+	return specificUpstreamAt(context.Background(), wires, p, model)
+}
+
+func specificUpstreamAt(ctx context.Context, wires map[string]string, p provider.Provider, model string) (string, bool) {
+	if p.ID == "" || model == "" || model == "*" {
+		return "", false
+	}
+	key := p.ID + "/" + model
+	snap := ""
+	if wires != nil {
+		snap = strings.TrimSpace(wires[key])
+	}
+	rawMap, frozen := modelWiresAt(ctx)
+	if !frozen {
+		rawMap = settings.Shared().ModelWires
+	}
+	raw := strings.TrimSpace(rawMap[key])
+	// the snapshot this request was built with wins, including when it
+	// no longer matches the settings in force. A value only Wires()
+	// synthesized for a SetModelID is not a SetUpstreamName. On a request,
+	// a key the snapshot does not have is not filled from the settings in
+	// force: a name saved while the request is in flight is the next
+	// request's.
+	n := snap
+	if n == "" && !frozen {
+		n = raw
+	}
+	if n == "" || synthesizedModelWireAt(ctx, wires, p, model, n, raw) {
+		return "", false
+	}
+	return strings.ReplaceAll(n, "*", model), true
+}
+
+// synthesizedModelWire reports whether n is the SetModelID entry Wires()
+// stores under the listed id: the vendor's own id, or a provider "*"
+// already applied to it. A ModelWires entry is a real SetUpstreamName.
+func synthesizedModelWire(wires map[string]string, p provider.Provider, model, n, raw string) bool {
+	return synthesizedModelWireAt(context.Background(), wires, p, model, n, raw)
+}
+
+func synthesizedModelWireAt(ctx context.Context, wires map[string]string, p provider.Provider, model, n, raw string) bool {
+	if raw != "" {
+		return false
+	}
+	own := ownModelIDAt(ctx, p, model)
+	if own == "" || own == model {
+		return false
+	}
+	if n == own {
+		return true
+	}
+	star := ""
+	if wires != nil {
+		star = strings.TrimSpace(wires[p.ID+"/*"])
+	}
+	if star == "" {
+		star = providerStarAt(ctx, p.ID)
+	}
+	return star != "" && n == strings.ReplaceAll(star, "*", own)
+}
+
+// providerStarAt is the provider's "*" name: the one in wires when the
+// caller has it, else the snapshot's ModelWires, else the settings in
+// force for a body built on its own.
+func providerStarAt(ctx context.Context, pid string) string {
+	raw, frozen := modelWiresAt(ctx)
+	if !frozen {
+		raw = settings.Shared().ModelWires
+	}
+	return strings.TrimSpace(raw[pid+"/*"])
+}
+
+// modelIdentified reports whether name is a model whose generation or
+// levels can be read. An opaque deployment or endpoint id (ep-123,
+// my-deployment) is not: generation, shape and compat stay on the model
+// magpie lists.
+func modelIdentified(name string) bool {
+	if name == "" {
+		return false
+	}
+	low := strings.ToLower(name)
+	if geminiGeneration(low) > 0 || strings.HasPrefix(low, "gemini-pro-agent") {
+		return true
+	}
+	// A prefixed or unversioned Gemini name (peta-gemini-4-hydrogen,
+	// gemini-flash-latest) has no readable Gemini generation; switching
+	// shape to it would drop a Gemini 3/4 model back to a 2.x budget
+	// even when catalog.EffortsOf strips its relay prefix (#7400).
+	if strings.Contains(low, "gemini") {
+		return false
+	}
+	return len(catalog.EffortsOf(name)) > 0
+}
+
+// wildcardWire is the provider's "*" name applied once to sent, the id
+// the request is going out under. "" when the provider has no "*".
+func wildcardWire(wires map[string]string, pid, sent string) string {
+	return wildcardWireAt(context.Background(), wires, pid, sent)
+}
+
+func wildcardWireAt(ctx context.Context, wires map[string]string, pid, sent string) string {
+	if pid == "" || sent == "" {
+		return ""
+	}
+	n := ""
+	if wires != nil {
+		n = strings.TrimSpace(wires[pid+"/*"])
+	}
+	if n == "" {
+		n = providerStarAt(ctx, pid)
+	}
+	if n == "" {
+		return ""
+	}
+	return strings.ReplaceAll(n, "*", sent)
+}
+
+// geminiCheckedModel is the model generation and thinking levels are read
+// from: a SetUpstreamName on the listed id, else that id's SetModelID
+// (and a rename of the vendor id), else a provider "*" whose target names
+// one model with no "*" of its own, else the listed id. A "*" that still
+// wraps the id is not applied here — Wires() has already folded it into a
+// listing, and applying it again sent openai/openai/gpt-5, or
+// peta-gemini-4-hydrogen where the levels belong to gemini-4-hydrogen
+// (#7400).
+func geminiCheckedModel(p provider.Provider, model string, wires map[string]string) string {
+	return geminiCheckedModelAt(context.Background(), p, model, wires)
+}
+
+func geminiCheckedModelAt(ctx context.Context, p provider.Provider, model string, wires map[string]string) string {
+	own := ownModelIDAt(ctx, p, model)
+	if w, ok := specificUpstreamAt(ctx, wires, p, model); ok {
+		if modelIdentified(w) {
+			return w
+		}
+		if own != model && modelIdentified(own) {
+			return own
+		}
+		return model
+	}
+	if own != model {
+		if w, ok := specificUpstreamAt(ctx, wires, p, own); ok {
+			if modelIdentified(w) {
+				return w
+			}
+			if modelIdentified(own) {
+				return own
+			}
+			return model
+		}
+	}
+	// a provider "*" that names one model, with no "*" in the target, is
+	// that model for every listing that has no name of its own. A wrapping
+	// "*" (gem/* → gemini-4-*) is also used when the listed/own name is not
+	// itself identified and expanding "*" yields an identified model (#7400).
+	if w, ok := literalProviderTargetAt(ctx, wires, p.ID); ok && modelIdentified(w) {
+		return w
+	}
+	base := own
+	if !modelIdentified(own) && modelIdentified(model) {
+		base = model
+	}
+	if !modelIdentified(base) {
+		if w := wildcardWireAt(ctx, wires, p.ID, own); w != "" && modelIdentified(w) {
+			return w
+		}
+	}
+	if own == model {
+		return model
+	}
+	// an opaque vendor id (SetModelID("gem/ep-123", "gemini-4-hydrogen"))
+	// is not a generation. Levels stay on the listed model (#7400).
+	if !modelIdentified(own) && modelIdentified(model) {
+		return model
+	}
+	return own
+}
+
+// upstreamWire is the model id a translated request is addressed to.
+// UpstreamNameAsIn on the listed id already applies a SetModelID and, at
+// most once, the provider's "*". A specific rename of the vendor id is
+// put on when that lookup only saw the listing. geminiAs is not looked up
+// again: it is the canonical model, and a second pass through the "*"
+// wrapped a name the first pass had already wrapped (#7400).
+func upstreamWire(wires map[string]string, p provider.Provider, listed string, req *Request) string {
+	return upstreamWireAt(context.Background(), wires, p, listed, req)
+}
+
+func upstreamWireAt(ctx context.Context, wires map[string]string, p provider.Provider, listed string, req *Request) string {
+	effort := ""
+	if req != nil {
+		effort = req.Effort
+	}
+	wire := provider.UpstreamNameAsIn(wires, p.ID, listed, p.SentIDAt(listed, effort))
+	own := ownModelIDAt(ctx, p, listed)
+	// a SetUpstreamName on the listed id, else on the vendor id a
+	// SetModelID lists it by — the same two codeAssistBody reads. The
+	// second was missed here, so a rename of the vendor id never reached
+	// the model field (#7400).
+	if w, ok := specificUpstreamAt(ctx, wires, p, listed); ok {
+		return w
+	}
+	if own != listed {
+		if w, ok := specificUpstreamAt(ctx, wires, p, own); ok {
+			return w
+		}
+	}
+	return wire
+}
+
+// levelTargetModel is the upstream model id a Gemini thinking-level refusal
+// belongs to: independent of effort so retries and subsequent requests share
+// one key, and changing when a SetUpstreamName, SetModelID or provider "*"
+// repoints the listed id to another model (#7400).
+func levelTargetModel(ctx context.Context, wires map[string]string, p provider.Provider, listed string) string {
+	if w := upstreamWireAt(ctx, wires, p, listed, nil); w != "" {
+		return w
+	}
+	return listed
+}
+
+// literalProviderTarget is a provider "*" whose target names one model,
+// with no "*" of its own: SetUpstreamName("gem/*", "gemini-4-argon").
+// A target that still has "*" wraps whatever is sent and is not a model
+// the levels are read from. A nil wires map reads the same settings
+// wildcardWireAt does (providerStarAt).
+func literalProviderTarget(wires map[string]string, pid string) (string, bool) {
+	return literalProviderTargetAt(context.Background(), wires, pid)
+}
+
+func literalProviderTargetAt(ctx context.Context, wires map[string]string, pid string) (string, bool) {
+	if pid == "" {
+		return "", false
+	}
+	n := ""
+	if wires != nil {
+		n = strings.TrimSpace(wires[pid+"/*"])
+	}
+	if n == "" {
+		n = providerStarAt(ctx, pid)
+	}
+	if n == "" || strings.Contains(n, "*") {
+		return "", false
+	}
+	return n, true
+}
+
 func geminiGeneration(model string) int {
 	m := geminiVersion.FindStringSubmatch(model)
 	if m == nil {

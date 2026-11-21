@@ -1109,43 +1109,273 @@ var gemini3Levels = []string{"minimal", "low", "medium", "high"}
 // THINKING_LEVEL_MINIMAL" at Vertex AI's, for reasoning_effort minimal and
 // thinking_level minimal alike; and gemini-3.1-pro-preview's
 // "thinking_level MINIMAL is not supported by this model" at its
-// generateContent.
-var geminiLevelRefused = lazyre.New(`(?i)thinking[ _]level\W+(?:(minimal|low|medium|high)\W+is not supported|is unsupported\W+thinking_level_(minimal|low|medium|high))`)
+// generateContent. xhigh is the same refusal on a Gemini 4 that hasn't
+// it (#7400): left unmatched, the 400 fell through to refusesThinkingConfig
+// and thinking_config was marked unfit for the whole provider.
+var geminiLevelRefused = lazyre.New(`(?i)thinking[ _]level\W+(?:(none|minimal|low|medium|high|xhigh)\W+is not supported|is unsupported\W+thinking_level_(none|minimal|low|medium|high|xhigh))`)
 
 // geminiRefusedLevel is the thinking level Gemini turned away in body
-// (geminiLevelRefused), or "".
+// (geminiLevelRefused), or "". When body is a JSON error envelope, only its
+// error message is inspected so echoed request details cannot trigger a
+// spurious level refusal (#7400).
 func geminiRefusedLevel(body []byte) string {
-	m := geminiLevelRefused.FindSubmatch(body)
+	src := body
+	if msg, ok := geminiErrorMessage(body); ok {
+		src = []byte(msg)
+	}
+	m := geminiLevelRefused.FindSubmatch(src)
 	if m == nil {
 		return ""
 	}
 	return strings.ToLower(string(m[1]) + string(m[2]))
 }
 
+// geminiErrorMessage is the text a JSON error envelope names: error when
+// it is a string or an object with a message, else the top-level message,
+// else a string detail. A JSON null, or any error that is neither a string
+// nor an object, is absent, so it does not hide that message (#7400). A
+// structured JSON error object without message, or a FastAPI detail array,
+// still counts as a recognized envelope (returning "", true) so callers do
+// not fall back to scanning echoed request fields in raw JSON.
+func geminiErrorMessage(body []byte) (string, bool) {
+	b := bytes.TrimSpace(body)
+	if len(b) == 0 {
+		return "", false
+	}
+	if b[0] == '[' {
+		var items []json.RawMessage
+		if json.Unmarshal(b, &items) == nil && len(items) > 0 {
+			return geminiErrorMessage(items[0])
+		}
+		return "", false
+	}
+	if b[0] != '{' {
+		return "", false
+	}
+	var top struct {
+		Error   json.RawMessage `json:"error"`
+		Message *string         `json:"message"`
+		Detail  json.RawMessage `json:"detail"`
+	}
+	if json.Unmarshal(b, &top) != nil {
+		return "", false
+	}
+	msg, hasMsg, hasErrObj := geminiPresentError(top.Error)
+	if hasMsg {
+		return msg, true
+	}
+	if top.Message != nil {
+		return *top.Message, true
+	}
+	detailRaw := bytes.TrimSpace(top.Detail)
+	if len(detailRaw) > 0 && detailRaw[0] == '"' {
+		var detailStr string
+		if json.Unmarshal(detailRaw, &detailStr) == nil {
+			return detailStr, true
+		}
+	}
+	if hasErrObj || (len(detailRaw) > 0 && detailRaw[0] == '[') {
+		return "", true
+	}
+	return "", false
+}
+
+// geminiPresentError extracts error's message when error is a JSON string
+// or an object with a message, and reports whether error was a JSON object
+// even without a message. null and other shapes are absent: unmarshalling
+// null into a string succeeds with "", which used to hide the envelope's
+// own message and detail (#7400).
+func geminiPresentError(raw json.RawMessage) (msg string, hasMsg bool, isObj bool) {
+	errRaw := bytes.TrimSpace(raw)
+	if len(errRaw) == 0 || bytes.Equal(errRaw, []byte("null")) {
+		return "", false, false
+	}
+	switch errRaw[0] {
+	case '"':
+		var errStr string
+		if json.Unmarshal(errRaw, &errStr) == nil {
+			return errStr, true, false
+		}
+	case '{':
+		var errObj struct {
+			Message *string `json:"message"`
+		}
+		if json.Unmarshal(errRaw, &errObj) == nil {
+			if errObj.Message != nil {
+				return *errObj.Message, true, true
+			}
+			return "", false, true
+		}
+	}
+	return "", false, false
+}
+
+// geminiErrorFields is the structured location text beside the message:
+// OpenAI's error.param, and a validation error's detail loc and msg.
+// geminiRefusedLevel does not read these, so an echoed request in some
+// other field cannot look like a thinking-level refusal (#7400).
+func geminiErrorFields(body []byte) string {
+	b := bytes.TrimSpace(body)
+	if len(b) > 0 && b[0] == '[' {
+		var items []json.RawMessage
+		if json.Unmarshal(b, &items) == nil && len(items) > 0 {
+			return geminiErrorFields(items[0])
+		}
+		return ""
+	}
+	if len(b) == 0 || b[0] != '{' {
+		return ""
+	}
+	var top struct {
+		Error  json.RawMessage `json:"error"`
+		Detail json.RawMessage `json:"detail"`
+	}
+	if json.Unmarshal(b, &top) != nil {
+		return ""
+	}
+	var parts []string
+	errRaw := bytes.TrimSpace(top.Error)
+	if len(errRaw) > 0 && errRaw[0] == '{' {
+		var errObj struct {
+			Param *string `json:"param"`
+		}
+		if json.Unmarshal(errRaw, &errObj) == nil && errObj.Param != nil && *errObj.Param != "" {
+			parts = append(parts, *errObj.Param)
+		}
+	}
+	parts = append(parts, geminiDetailFields(top.Detail)...)
+	return strings.Join(parts, " ")
+}
+
+// geminiDetailFields is a string detail (FastAPI HTTPException) or
+// detail[].loc and detail[].msg (FastAPI/Starlette validation error).
+// Echoed detail[].input is intentionally excluded.
+func geminiDetailFields(raw json.RawMessage) []string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil
+	}
+	if raw[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) == nil && s != "" {
+			return []string{s}
+		}
+		return nil
+	}
+	if raw[0] != '[' {
+		return nil
+	}
+	var items []struct {
+		Loc json.RawMessage `json:"loc"`
+		Msg string          `json:"msg"`
+	}
+	if json.Unmarshal(raw, &items) != nil {
+		return nil
+	}
+	var parts []string
+	for _, it := range items {
+		if it.Msg != "" {
+			parts = append(parts, it.Msg)
+		}
+		parts = append(parts, geminiLocFields(it.Loc)...)
+	}
+	return parts
+}
+
+// geminiLocFields is a validation loc: one string, or the strings in an
+// array. Numbers in the path are indexes, not field names.
+func geminiLocFields(raw json.RawMessage) []string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+	if raw[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) == nil && s != "" {
+			return []string{s}
+		}
+		return nil
+	}
+	if raw[0] != '[' {
+		return nil
+	}
+	var segs []json.RawMessage
+	if json.Unmarshal(raw, &segs) != nil {
+		return nil
+	}
+	var parts []string
+	for _, seg := range segs {
+		seg = bytes.TrimSpace(seg)
+		if len(seg) == 0 || seg[0] != '"' {
+			continue
+		}
+		var s string
+		if json.Unmarshal(seg, &s) == nil && s != "" {
+			parts = append(parts, s)
+		}
+	}
+	return parts
+}
+
 // refusesThinkingConfig recognizes an upstream turning a request away for
-// the thinking_config it was sent, by its error naming it.
+// the thinking_config it was sent, by its error naming it. The message and
+// the structured field location (error.param, detail loc and msg) are what
+// is searched. A thinking-level refusal in the message is never a refusal
+// of the thinking_config field, and geminiRefusedLevel still reads only
+// that message so an echoed request cannot look like one (#7400).
 func refusesThinkingConfig(status int, body []byte) bool {
 	if !badRequest(status) {
 		return false
 	}
-	b := bytes.ToLower(body)
+	src := body
+	if msg, ok := geminiErrorMessage(body); ok {
+		src = []byte(msg)
+	}
+	if geminiRefusedLevel(src) != "" {
+		return false
+	}
+	if fields := geminiErrorFields(body); fields != "" {
+		src = append(append(append([]byte{}, src...), ' '), fields...)
+	}
+	b := bytes.ToLower(src)
 	return bodyHas(b, "extra_body") || bodyHas(b, "thinking") || bodyHas(b, "include_thoughts")
+}
+
+// geminiLevelRefits is an effort GeminiCompat will bring down to a level
+// the model still has (geminiCompatLevels). Gemini 3's levels, plus xhigh: a
+// refused xhigh is asked again at high, and one the model's levels don't
+// list is brought down before the first send. xhigh is not one of
+// gemini3Levels — an unknown model is not asked at it.
+func geminiLevelRefits(effort string) bool {
+	return geminiAboveHigh(effort) || slices.Contains(gemini3Levels, effort)
 }
 
 // aiStudioThinking is the thinking_config asking Gemini for its thoughts at
 // the effort the client asked, for a client that asked to see them: a level
 // for Gemini 3 and later, a budget for 2.x (the steps Google maps
-// reasoning_effort to).
+// reasoning_effort to). xhigh, max and ultra are sent as xhigh only when
+// this model lists xhigh (geminiAllowsXHigh); Gemini 3 and an unlisted
+// Gemini 4 stay at high (#7400). fitFor has already brought xhigh down to
+// high for a model whose levels stop there. A SetModelID or SetUpstreamName
+// alias is read from Request.geminiAs, the model the upstream is actually
+// asked for.
 func aiStudioThinking(r *Request, model string) map[string]any {
 	if !r.Thinking || r.ThinkOff || r.Effort == "none" {
 		return nil
 	}
+	if r.geminiAs != "" {
+		model = r.geminiAs
+	}
 	tc := map[string]any{"include_thoughts": true}
-	level := r.Effort
-	switch level {
-	case "xhigh", "max":
-		level = "high"
-	case "minimal", "low", "medium", "high":
+	level := strings.ToLower(strings.TrimSpace(r.Effort))
+	switch {
+	case geminiAboveHigh(level):
+		if r.allowsXHigh(model) {
+			level = "xhigh"
+		} else {
+			level = "high"
+		}
+	case level == "minimal" || level == "low" || level == "medium" || level == "high":
 	default:
 		return tc // the model's own
 	}

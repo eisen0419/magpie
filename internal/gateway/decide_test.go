@@ -510,7 +510,22 @@ func TestWithEffort(t *testing.T) {
 		{provider.Anthropic, `{"max_tokens":32000,"thinking":{"type":"enabled","budget_tokens":4096}}`, "high", []string{`"budget_tokens":24000`}},
 		{provider.Anthropic, `{"max_tokens":8000,"thinking":{"type":"enabled","budget_tokens":4096}}`, "xhigh", []string{`"budget_tokens":7999`}},
 		{provider.Anthropic, `{"max_tokens":8000,"thinking":{"type":"disabled"}}`, "high", []string{`"type":"disabled"`}},
+		{provider.Gemini, `{"generationConfig":{"temperature":0.2,"thinkingConfig":{"thinkingLevel":"low","includeThoughts":true}}}`, "high", []string{`"thinkingLevel":"high"`, `"includeThoughts":true`, `"temperature":0.2`}},
+		{provider.Gemini, `{"generationConfig":{"thinkingConfig":{"thinkingLevel":"none"}}}`, "high", []string{`"thinkingLevel":"none"`}},
+		{provider.Gemini, `{"generationConfig":{"thinkingConfig":{"thinkingLevel":"NONE"}}}`, "high", []string{`"thinkingLevel":"NONE"`}},
+		{provider.Gemini, `{"generationConfig":{"thinkingConfig":{"thinkingLevel":""}}}`, "high", []string{`"thinkingLevel":""`}},
+		{provider.Gemini, `{"generationConfig":{"thinkingConfig":{"thinkingBudget":128}}}`, "high", []string{`"thinkingBudget":128`}},
+		{provider.Gemini, `{"generationConfig":{"thinkingConfig":{"thinkingLevel":1}}}`, "high", []string{`"thinkingLevel":1`}},
+		{provider.Gemini, `{"generationConfig":{"temperature":0.2}}`, "high", []string{`"temperature":0.2`}},
 	} {
+		// withBodyEffort still rewrites a Gemini "none" the refusal path
+		// asks again at low; withEffort leaves that none alone.
+		if c.proto == provider.Gemini && strings.Contains(c.in, `"thinkingLevel":"none"`) {
+			got := string(withBodyEffort(provider.Gemini, []byte(c.in), "low"))
+			if !strings.Contains(got, `"thinkingLevel":"low"`) {
+				t.Errorf("withBodyEffort left none: %s", got)
+			}
+		}
 		got := string(withEffort(c.proto, []byte(c.in), c.effort))
 		for _, w := range c.want {
 			if !strings.Contains(got, w) {

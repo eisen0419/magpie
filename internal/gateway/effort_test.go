@@ -236,6 +236,8 @@ func TestGeminiRequestEffort(t *testing.T) {
 		want string
 	}{
 		{`{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}`, "high"},
+		{`{"generationConfig":{"thinkingConfig":{"thinkingLevel":"minimal"}}}`, "minimal"},
+		{`{"generationConfig":{"thinkingConfig":{"thinkingLevel":"MINIMAL"}}}`, "minimal"},
 		{`{"generationConfig":{"thinkingConfig":{"thinking_level":"LOW"}}}`, "low"},
 		{`{"generationConfig":{"thinkingConfig":{"thinkingBudget":512}}}`, "low"},
 		{`{"generationConfig":{"thinkingConfig":{"thinking_budget":32768}}}`, "xhigh"},

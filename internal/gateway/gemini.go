@@ -107,6 +107,13 @@ type gThinking struct {
 func (tc *gThinking) effort() string {
 	switch {
 	case tc.ThinkingLevel != "":
+		// minimal and none are levels of their own. effortOf reads both
+		// as low, which logged low while the wire still said none, and
+		// left the none refusal unreachable (#7400).
+		switch strings.ToLower(strings.TrimSpace(tc.ThinkingLevel)) {
+		case "minimal", "none":
+			return strings.ToLower(strings.TrimSpace(tc.ThinkingLevel))
+		}
 		return effortOf(tc.ThinkingLevel)
 	case tc.ThinkingBudget != nil && *tc.ThinkingBudget < 0:
 		return "medium" // -1: let the model decide
@@ -138,6 +145,11 @@ func geminiBodyEffort(body []byte) string {
 // {parts:[{text}]}. droid sends no stream field; Factory answers SSE either
 // way, and a client that asked for JSON is given it after the fact.
 func buildGemini(r *Request, model string) ([]byte, error) {
+	// an alias's upstream model: generation and thinkingLevel are that
+	// model's, and the body is addressed to it (#7400)
+	if r != nil && r.geminiAs != "" {
+		model = r.geminiAs
+	}
 	req, err := geminiRequest(r, model, "gemini")
 	if err != nil {
 		return nil, err
@@ -284,6 +296,13 @@ func parseGemini(body []byte) (*Request, error) {
 		if tc := gc.ThinkingConfig; tc != nil {
 			r.Effort = tc.effort()
 			r.Thinking = r.Effort != ""
+			// none is thinking off, as a Chat or Responses client asking
+			// none is read. Left as none, with ThinkOff false, it was
+			// translated with that word still on the wire (#7400).
+			if r.Effort == "none" {
+				r.ThinkOff = true
+				r.Effort = "low"
+			}
 		}
 		// the size and shape of the image asked for, which only an
 		// upstream that speaks Gemini takes (#3820)

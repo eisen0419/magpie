@@ -371,6 +371,23 @@ func turnEffort(body []byte) string {
 	return last
 }
 
+// turnWireEffort is the last effort a message carries in its own
+// output_config, in the wire's own words. none and minimal stay
+// themselves: effortOf would read both as low. ok is false when no
+// message names a level.
+func turnWireEffort(body []byte) (string, bool) {
+	if !bodyHas(body, `"output_config"`) {
+		return "", false
+	}
+	last, ok := "", false
+	for _, e := range gjson.GetBytes(body, "messages.#.output_config.effort").Array() {
+		if v, good := normWireLevel(e.String()); good {
+			last, ok = v, true
+		}
+	}
+	return last, ok
+}
+
 // thinkingOffUnlessAsked says thinking is off when the request doesn't
 // mention it. That is what Anthropic's API assumes, but DeepSeek and other
 // vendors' Anthropic endpoints think by default, so Claude Code's requests
@@ -1167,7 +1184,7 @@ func anthropicBody(r *Request, model, host string, replay bool) []byte {
 		// that asked to reason would see none of it; OpenAI is asked for
 		// its summary and the Claude subscription for summarized alike
 		out["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
-		if e := r.Effort; e != "" {
+		if e := effortOf(r.Effort); e != "" {
 			if e == "xhigh" && noXhigh(model) {
 				e = "max"
 			}
@@ -1184,8 +1201,8 @@ func anthropicBody(r *Request, model, host string, replay bool) []byte {
 			maxTokens = budget + 4096
 		}
 		out["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
-		if r.Effort != "" && outputEffortAt(host, model) {
-			out["output_config"] = map[string]any{"effort": r.Effort}
+		if e := effortOf(r.Effort); e != "" && outputEffortAt(host, model) {
+			out["output_config"] = map[string]any{"effort": e}
 		}
 	} else if r.Temp != nil {
 		out["temperature"] = *r.Temp

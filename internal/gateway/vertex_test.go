@@ -810,6 +810,32 @@ func TestVertexThinkingRange(t *testing.T) {
 	}
 }
 
+// Gemini never takes max on the wire. xhigh where the model lists it,
+// high where it does not, including a custom list that still names max.
+func TestVertexThinkingMaxStaysOffTheWire(t *testing.T) {
+	fresh(t)
+	loadGeminiXHighCatalog(t)
+	for _, c := range []struct {
+		name, model, want string
+		r                 Request
+	}{
+		{"catalog hydrogen", "gemini-4-hydrogen", "xhigh", Request{Effort: "max", Thinking: true}},
+		{"catalog argon", "gemini-4-argon", "high", Request{Effort: "max", Thinking: true}},
+		{"catalog gemini 3", "gemini-3.8-flash", "high", Request{Effort: "max", Thinking: true}},
+		{"custom list with xhigh", "gemini-4-quartz", "xhigh", Request{Effort: "max", Thinking: true, geminiEffortsSet: true, geminiEfforts: []string{"low", "high", "xhigh", "max"}}},
+		{"custom list without xhigh", "gemini-4-quartz", "high", Request{Effort: "max", Thinking: true, geminiEffortsSet: true, geminiEfforts: []string{"low", "high", "max"}}},
+	} {
+		got := vertexThinking(&c.r, c.model)
+		lv, _ := got["thinkingLevel"].(string)
+		if lv != c.want {
+			t.Errorf("%s: thinkingLevel %q, want %q (%v)", c.name, lv, c.want, got)
+		}
+		if lv == "max" {
+			t.Errorf("%s: max reached the wire", c.name)
+		}
+	}
+}
+
 // The name a user gave a Vertex AI model upstream is the one in the path
 // it is asked at, from every API, and the one the usage log names.
 func TestVertexUpstreamName(t *testing.T) {

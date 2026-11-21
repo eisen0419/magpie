@@ -23,7 +23,8 @@ import (
 //     level as effortOfBudget reads it; an effort the request names is the
 //     one kept.
 //   - Chat: extra_body's google thinking_config budget goes as its
-//     thinking_level.
+//     thinking_level. A thinking_level or thinkingLevel already there is
+//     fitted the same way, in either spelling.
 //
 // Either way the level is fitted to the model's (geminiLevelFor), and a
 // reasoning_effort or output_config effort above what it has comes down
@@ -31,12 +32,15 @@ import (
 // one for Gemini's own OpenAI-compatible API (geminiCompat), which takes
 // a budget and whose levels the Chat path fits, and asks again when one
 // is turned away (geminiRefusedLevel).
-func geminiLevelBody(p provider.Provider, proto provider.Protocol, model string, body []byte) []byte {
+func geminiLevelBody(p provider.Provider, proto provider.Protocol, listed, model string, body []byte) []byte {
 	if proto != provider.Anthropic && proto != provider.Chat {
 		return body
 	}
 	if proto == provider.Chat && geminiCompat(p.VendorHost(), model) {
 		return body
+	}
+	if listed == "" {
+		listed = model
 	}
 	m := strings.ToLower(model)
 	if geminiGeneration(m) < 3 {
@@ -52,7 +56,7 @@ func geminiLevelBody(p provider.Provider, proto provider.Protocol, model string,
 		return body
 	}
 	fields := map[string]any{}
-	efforts := p.Efforts(model)
+	efforts := geminiGateEfforts(p, listed, model)
 	switch proto {
 	case provider.Anthropic:
 		th, _ := top["thinking"].(map[string]any)
@@ -121,6 +125,18 @@ func geminiLevelBody(p provider.Provider, proto provider.Protocol, model string,
 				tc["thinking_level"] = geminiLevelForEfforts(m, effortOfBudget(int(b)), efforts)
 			}
 		}
+		for _, lk := range []string{"thinking_level", "thinkingLevel"} {
+			cur, ok := tc[lk].(string)
+			if !ok || strings.TrimSpace(cur) == "" {
+				continue
+			}
+			// a level already in the config, not only one just made from
+			// a budget. Argon was still sent xhigh from extra_body.
+			if fit := geminiLevelForEfforts(m, cur, efforts); fit != cur {
+				tc[lk] = fit
+				changed = true
+			}
+		}
 		if changed {
 			google[key] = tc
 			eb["google"] = google
@@ -161,7 +177,15 @@ func geminiLevelForEfforts(model, effort string, efforts []string) string {
 		ls = catalog.EffortsOf(model)
 	}
 	if len(ls) > 0 {
-		ls = slices.DeleteFunc(slices.Clone(ls), func(l string) bool { return l == "none" })
+		capLevel := "high"
+		if geminiGeneration(strings.ToLower(model)) >= 4 {
+			capLevel = "xhigh"
+		}
+		maxIdx := slices.Index(effortRank, capLevel)
+		ls = slices.DeleteFunc(slices.Clone(ls), func(l string) bool {
+			ll := strings.ToLower(l)
+			return ll == "none" || ll == "max" || slices.Index(effortRank, ll) > maxIdx
+		})
 		if len(ls) > 0 {
 			return catalog.NearestEffort(level, ls)
 		}

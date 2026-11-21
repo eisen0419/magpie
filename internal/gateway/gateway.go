@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -219,11 +220,35 @@ func offSpreadRefused(model string, ids []string) string {
 // for a whole report.
 type wiresKey struct{}
 
+// requestWires is that set: Wires(), the ModelWires it was made from, and the
+// ModelIDs in force when the request arrived, cloned so a mapping saved while
+// the request is in flight is not one of them. ModelWires says which entries
+// are a SetUpstreamName and which Wires() synthesized for a SetModelID.
+type requestWires struct {
+	computed map[string]string
+	raw      map[string]string
+	modelIDs map[string]string
+}
+
 // withWires carries the names in force on r's context, read at most once and
 // only where something asks for one: a request refused before any name is
 // looked up pays for nothing.
 func withWires(r *http.Request) *http.Request {
-	load := sync.OnceValue(func() map[string]string { return settings.Shared().Wires() })
+	load := sync.OnceValue(func() requestWires {
+		s := settings.Shared()
+		computed, raw := s.Wires(), s.ModelWires
+		if computed != nil {
+			computed = maps.Clone(computed)
+		}
+		if raw != nil {
+			raw = maps.Clone(raw)
+		}
+		ids := maps.Clone(s.ModelIDs)
+		if ids == nil {
+			ids = map[string]string{}
+		}
+		return requestWires{computed: computed, raw: raw, modelIDs: ids}
+	})
 	return r.WithContext(context.WithValue(r.Context(), wiresKey{}, load))
 }
 
@@ -231,10 +256,84 @@ func withWires(r *http.Request) *http.Request {
 // ones in force now for a request magpie made for itself and never carried
 // them on.
 func wiresOf(ctx context.Context) map[string]string {
-	if load, ok := ctx.Value(wiresKey{}).(func() map[string]string); ok {
-		return load()
+	if load, ok := ctx.Value(wiresKey{}).(func() requestWires); ok {
+		return load().computed
 	}
 	return settings.Shared().Wires()
+}
+
+// modelWiresAt is the ModelWires captured with the request's Wires(), and
+// whether ctx carries that snapshot. A lookup on a request uses it instead
+// of the settings in force. A context without the snapshot is a body built
+// on its own, which reads the settings in force.
+func modelWiresAt(ctx context.Context) (map[string]string, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	load, ok := ctx.Value(wiresKey{}).(func() requestWires)
+	if !ok {
+		return nil, false
+	}
+	raw := load().raw
+	if raw == nil {
+		raw = map[string]string{}
+	}
+	return raw, true
+}
+
+// modelIDsAt is the ModelIDs captured with the request's Wires(), and whether
+// ctx carries that snapshot. A test-constructed snapshot without modelIDs
+// falls back to live settings.
+func modelIDsAt(ctx context.Context) (map[string]string, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	load, ok := ctx.Value(wiresKey{}).(func() requestWires)
+	if !ok {
+		return nil, false
+	}
+	ids := load().modelIDs
+	if ids == nil {
+		return nil, false
+	}
+	return ids, true
+}
+
+// ownModelIDAt is p.OwnModelID(listed) read from the request's frozen ModelIDs
+// snapshot when ctx carries one, so a SetModelID saved while a request is in
+// flight does not redirect its retries (#7400).
+func ownModelIDAt(ctx context.Context, p provider.Provider, listed string) string {
+	ids, frozen := modelIDsAt(ctx)
+	if !frozen {
+		if own := p.OwnModelID(listed); own != "" {
+			return own
+		}
+		return listed
+	}
+	if !p.TakesModelIDs() || p.ID == "" || listed == "" {
+		return listed
+	}
+	prefix := p.ID + "/"
+	bestLocal := map[string]string{}
+	ownByLocal := map[string]string{}
+	for k, own := range ids {
+		m, ok := strings.CutPrefix(k, prefix)
+		own = strings.TrimSpace(own)
+		if !ok || m == "" || own == "" || own == m {
+			continue
+		}
+		if had, exists := bestLocal[own]; exists && had < m {
+			continue
+		}
+		if had, exists := bestLocal[own]; exists {
+			delete(ownByLocal, had)
+		}
+		bestLocal[own], ownByLocal[m] = m, own
+	}
+	if own, ok := ownByLocal[listed]; ok {
+		return own
+	}
+	return listed
 }
 
 // The reasons serve gives a model move of its own (ModelMove.Why);
@@ -6665,18 +6764,39 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 		// the user's own fields for the provider (#1604), last, so the
 		// body is as it goes out when they fill in what it lacks, and
 		// before it is signed
+		before := ""
+		if to == provider.Anthropic {
+			before = gjson.GetBytes(body, "thinking.type").String()
+		}
 		extra := p.WithExtraBody(body, conv)
-		if to == provider.Anthropic && !bytes.Equal(extra, body) {
-			// a thinking budget the user's fields put in is fitted to a
-			// model that thinks only adaptively as the agent's is, its
-			// display to the provider
-			extra = s.withoutRefusedShapes(p, adaptiveThinking(extra))
+		if to == provider.Anthropic {
+			if !bytes.Equal(extra, body) {
+				// a thinking budget the user's fields put in is fitted to a
+				// model that thinks only adaptively as the agent's is, its
+				// display to the provider
+				extra = s.withoutRefusedShapes(p, adaptiveThinking(extra))
+			}
+			after := gjson.GetBytes(extra, "thinking.type").String()
+			// thinkingOffUnlessAsked may already have appended disabled,
+			// so after == before even when the user's extra body is what
+			// turned thinking off. That still counts (#7400).
+			if (after == "disabled" || after == "between_tools") && (after != before || extraDisablesThinking(p)) {
+				noteExtraDisabled(ctx)
+			}
 		}
 		body = extra
 	}
 	if !countsTokens(path) {
-		// the tier it goes at, the user's own fields in it (#1784)
+		// the tier it goes at, the user's own fields in it (#1784), and
+		// the effort those fields left in the body (#7400). The body is
+		// decoded again only when it changed after noteWireEffort, or
+		// when nothing noted an effort yet (a relay). An unchanged
+		// multi-megabyte body is not parsed into a map.
 		noteWireTier(ctx, to, body)
+		noteWireSentLevel(ctx, to, body)
+		if wireBodyStale(ctx, body) {
+			noteWireBody(ctx, to, body)
+		}
 	}
 	if to == provider.Anthropic && p.IsVertex() {
 		// Claude at the project, as Anthropic's Vertex SDK asks it: the
@@ -7073,6 +7193,9 @@ func biliProxied(path string) bool {
 func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.Provider, proto provider.Protocol, model string, body []byte, u *Usage) (status int, msg string, done bool) {
 	// the headers the user gave the model, on p's requests for it
 	r = r.WithContext(provider.WithModel(r.Context(), p.ID, model))
+	// record whether the inbound relayed body carried a wire effort before
+	// passthrough or forwardOnce strips it (#7400)
+	noteRelayEffort(r.Context(), proto, body)
 	// the reply limit the client named, read before the body is rewritten:
 	// a reply cut at its length that said nothing is a void to fail at
 	// once, unless it was asked for little (#2972)
@@ -7085,7 +7208,25 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	}
 	// a relay's effort family goes as the id of the effort asked
 	// (effort_variants.go); any other model as magpie knows it
-	upstream := provider.UpstreamNameAsIn(wiresOf(r.Context()), p.ID, model, p.SentIDAt(model, sentEffortIf(p, model, proto, body)))
+	passWires := wiresOf(r.Context())
+	upstream := provider.UpstreamNameAsIn(passWires, p.ID, model, p.SentIDAt(model, sentEffortIf(p, model, proto, body)))
+	// a SetUpstreamName on the listed id, else on the vendor id a
+	// SetModelID lists it by — the same two upstreamWire reads. The
+	// second was missed here, so a ModelWires entry on the vendor id
+	// shaped against one model while the body still sent another
+	// (#7400). An opaque vendor id with no rename of its own is still
+	// what is sent.
+	ownID := ownModelIDAt(r.Context(), p, model)
+	if w, ok := specificUpstreamAt(r.Context(), passWires, p, model); ok {
+		upstream = w
+	} else if ownID != model {
+		if w, ok := specificUpstreamAt(r.Context(), passWires, p, ownID); ok {
+			upstream = w
+		}
+	}
+	// the model generation and levels belong to, when an alias sends
+	// another (#7400). "" when it is model.
+	checked := geminiCheckedModelAt(r.Context(), p, model, passWires)
 	body = rewriteModel(body, upstream)
 	if proto == provider.Chat {
 		body = withMistralCacheKey(p, r.Header, body)
@@ -7264,6 +7405,10 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		// a signature another provider gave goes to none (ownSignatures)
 		body = geminiBodySignatures(body, p.ID, true)
 	case provider.Anthropic:
+		// before thinkingOffUnlessAsked appends disabled: a client that
+		// asked for thinking off is logged as none, an appended default
+		// is not (#7400)
+		noteAnthropicAsked(r.Context(), body)
 		// what the client holds, taken before the upstream gets its own
 		// call ids back below, and those given back to it (tool_use_ids.go,
 		// #4910)
@@ -7329,12 +7474,61 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	// reasoning off at a level the model turned away before (below), at its
 	// lowest
 	asked := bodyEffort(proto, body)
-	effort := fitFor(p, model, asked)
-	if offEffort(effort) && s.turnedAway(p, model, effort, proto) {
+	checkedName := model
+	if checked != "" {
+		checkedName = checked
+	}
+	// Gemini's own API, and a Chat passthrough of Gemini's OpenAI-compatible
+	// API, fit and clamp against the model the upstream is asked for
+	// (#7400). A relayed Chat elsewhere is fitted to the id listed.
+	fitModel := model
+	geminiPass := passthroughGemini(p, proto, checkedName)
+	if geminiPass && checked != "" && checked != model {
+		fitModel = checked
+	}
+	// extra_body.google.thinking_config.thinking_level is the level a
+	// GeminiCompat chat sends when it names no reasoning_effort (#7400)
+	if geminiPass && proto == provider.Chat {
+		noteGeminiCompat(r.Context())
+		if e, ok := chatGeminiLevel(body); ok {
+			asked = e
+		}
+	}
+	// levels the user set, and a live list, live on the id magpie lists.
+	// An opaque deployment id has none of its own.
+	fitAt := effortFitModelAt(r.Context(), p, model, fitModel)
+	effort := fitFor(p, fitAt, asked)
+	if strings.EqualFold(effort, asked) {
+		effort = asked // the client's own spelling of a level it has
+	}
+	// an unlisted Gemini 4, or one whose levels stop at high, is not sent
+	// xhigh: fitFor keeps xhigh when no levels are known (#7400). max is
+	// the same clamp. A level this upstream target already turned away is
+	// asked at high from then on.
+	levelTarget := levelTargetModel(r.Context(), passWires, p, model)
+	if geminiPass {
+		efforts := geminiGateEffortsAt(r.Context(), p, model, fitModel)
+		switch {
+		case strings.EqualFold(effort, "xhigh") && (!geminiAllowsXHigh(fitModel, efforts) || s.turnedAway(p, levelTarget, "xhigh", proto)):
+			effort = "high"
+		case geminiAboveHigh(effort) && !strings.EqualFold(effort, "xhigh"):
+			// Gemini never takes max or ultra on the wire. A custom list that
+			// includes them still goes as xhigh where the model has it and
+			// upstream has not turned xhigh away, else high (#7400).
+			effort = "high"
+			if geminiAllowsXHigh(fitModel, efforts) && !s.turnedAway(p, levelTarget, "xhigh", proto) {
+				effort = "xhigh"
+			}
+		}
+	}
+	if offEffort(effort) && (s.turnedAway(p, model, effort, proto) || geminiPass && !s.fits(p.ID, levelRefused(levelTarget, effort), proto)) {
 		effort = onEffort(p, model)
 	}
 	if asked != "" && effort != asked {
 		body = withBodyEffort(proto, body, effort)
+		if geminiPass && proto == provider.Chat {
+			body = withGeminiCompatLevel(body, effort)
+		}
 	}
 	path := upstreamPath(p, proto, upstream)
 	if proto == provider.Responses && unaryCompact(r) {
@@ -7391,8 +7585,13 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	// nor a system turn in Messages (xai_body.go, #3392)
 	body = xaiBody(p, proto, body)
 	// a Gemini 3 or later on an Anthropic or Chat relay is asked a
-	// thinking level, never a budget (gemini_level_body.go)
-	body = geminiLevelBody(p, proto, model, body)
+	// thinking level, never a budget (gemini_level_body.go). An alias is
+	// judged by the model the upstream is asked for.
+	levelModel := model
+	if checked != "" && checked != model {
+		levelModel = checked
+	}
+	body = geminiLevelBody(p, proto, model, levelModel, body)
 	// a Grok subscription is given Codex's namespaced functions flat
 	// (grokBody), and Zed's plugin likewise (ZedBody); a call to one goes
 	// back under its namespace (#404). Any vendor asked as Codex sends it
@@ -7767,16 +7966,39 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		}
 	}
 	offRetried := false
-	if e := bodyEffort(proto, body); res.StatusCode == http.StatusBadRequest && (e == "none" || e == "minimal" || proto == provider.Chat && hasReasoningDisabled(body)) {
+	if badRequest(res.StatusCode) && passthroughGemini(p, proto, fitModel) && strings.EqualFold(sentGeminiLevel(r.Context(), proto, body, true), "xhigh") {
+		// xhigh turned away by name, on Gemini's own API or its
+		// OpenAI-compatible Chat: asked again at high, and so from then
+		// on, without marking thinking_config unfit (#7400). none and
+		// minimal are the block below.
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		res.Body.Close()
+		res.Body = io.NopCloser(bytes.NewReader(b))
+		if strings.EqualFold(geminiRefusedLevel(b), "xhigh") {
+			s.markUnfit(p.ID, levelRefused(levelTarget, "xhigh"), proto)
+			offRetried = true
+			nb := withBodyEffort(proto, body, "high")
+			if proto == provider.Chat {
+				nb = withGeminiCompatLevel(nb, "high")
+			}
+			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(nb), r.Header); err != nil {
+				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
+			}
+		}
+	}
+	if e := sentLevel(proto, body, geminiPass); (res.StatusCode == http.StatusBadRequest || geminiPass && badRequest(res.StatusCode)) && !offRetried && (e == "none" || e == "minimal" || proto == provider.Chat && hasReasoningDisabled(body)) {
 		// A model can refuse reasoning turned off. If it names its levels,
 		// or Gemini the level it hasn't, try its lowest, and from then on;
 		// if OpenRouter requires reasoning, leave the level to it.
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		res.Body.Close()
 		res.Body = io.NopCloser(bytes.NewReader(b))
-		if gemini := geminiRefusedLevel(b) != ""; (e == "none" || e == "minimal") && (effortLevelsNamed.Match(b) || gemini) {
+		sentExplicit := sentGeminiLevel(r.Context(), proto, body, geminiPass)
+		if gemini := sentExplicit != "" && strings.EqualFold(sentExplicit, e) && strings.EqualFold(geminiRefusedLevel(b), e); (e == "none" || e == "minimal") && (res.StatusCode == http.StatusBadRequest && effortLevelsNamed.Match(b) || gemini) {
 			refused := offRefused(model)
-			if gemini || otherOffNamed[e].Match(b) {
+			if gemini {
+				refused = levelRefused(levelTarget, e)
+			} else if otherOffNamed[e].Match(b) {
 				// the level turned away, not reasoning off: AI Studio
 				// takes none from gemini-3.8-flash, not minimal, and
 				// OpenAI lists none where gpt-5.1 turns minimal away
@@ -7784,10 +8006,14 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			}
 			s.markUnfit(p.ID, refused, proto)
 			offRetried = true
-			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(withBodyEffort(proto, body, onEffort(p, model))), r.Header); err != nil {
+			nb := withBodyEffort(proto, body, onEffort(p, model))
+			if geminiPass && proto == provider.Chat {
+				nb = withGeminiCompatLevel(nb, onEffort(p, model))
+			}
+			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(nb), r.Header); err != nil {
 				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
 			}
-		} else if proto == provider.Chat && mandatoryReasoning.Match(b) {
+		} else if proto == provider.Chat && res.StatusCode == http.StatusBadRequest && mandatoryReasoning.Match(b) {
 			if nb, ok := withoutReasoningOff(body); ok {
 				offRetried = true
 				if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(nb), r.Header); err != nil {
@@ -8709,23 +8935,49 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		r := *req
 		r.Effort, r.ThinkOff, r.Thinking, req = "", false, false, &r
 	}
+	// the names in force, read once however many endpoints the request is
+	// built for below. The model an alias asks for is resolved before the
+	// effort is fitted: a rename onto argon clamps xhigh, and an alias
+	// onto hydrogen is fitted to hydrogen's levels, not the name listed
+	// (#7400).
+	wires := wiresOf(ctx)
+	upModel := geminiCheckedModelAt(ctx, p, model, wires)
+	eff := geminiGateEffortsAt(ctx, p, model, upModel)
+	if upModel != model && req.geminiAs != upModel || !req.geminiEffortsSet || !slices.Equal(req.geminiEfforts, eff) {
+		r := *req
+		if upModel != model {
+			r.geminiAs = upModel
+		}
+		r.geminiEfforts, r.geminiEffortsSet = eff, true
+		req = &r
+	}
+	fitModel := model
+	if req.geminiAs != "" {
+		fitModel = req.geminiAs
+	}
 	if req.Effort != "" {
-		if e := fitFor(p, model, req.Effort); e != req.Effort {
+		// an upstream name with no levels of its own — an opaque
+		// deployment id, or a SetModelID whose efforts moved to the
+		// listed id — is fitted as the model magpie lists (#7400)
+		if e := fitFor(p, effortFitModelAt(ctx, p, model, fitModel), req.Effort); e != req.Effort {
 			r := *req
 			r.Effort, req = e, &r
 		}
 	}
 	// Gemini's signatures another provider gave go to none (ownSignatures)
 	req = ownSignatures(req, p.ID)
-	if p.IsVertex() && !provider.VertexPartner(model) && !provider.VertexClaude(model) {
-		// Gemini's levels; a partner model on chat completions, and
-		// Claude on Anthropic's Messages API, are sent their effort as
-		// at any vendor of that API
-		req = vertexEffort(req, p.Efforts(model))
+	if p.IsVertex() && !provider.VertexPartner(fitModel) && !provider.VertexClaude(fitModel) {
+		// Gemini's levels, of the model the upstream is asked for; a
+		// partner model on chat completions, and Claude on Anthropic's
+		// Messages API, are sent their effort as at any vendor of that API.
+		// The levels resolved with the alias are the ones fitted, so a
+		// rename onto hydrogen is not clamped as an unknown model.
+		levels := p.Efforts(fitModel)
+		if req.geminiEffortsSet {
+			levels = req.geminiEfforts
+		}
+		req = vertexEffort(req, levels)
 	}
-	// the names in force, read once however many endpoints the request is
-	// built for below
-	wires := wiresOf(ctx)
 	web := req.WebSearch
 	// the cache key was left out to see if it was what the upstream refused
 	dropped := false
@@ -8795,6 +9047,14 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			r := *req
 			r.Effort, req = onEffort(p, model), &r
 		}
+		levelTarget := levelTargetModel(ctx, wires, p, model)
+		if geminiAboveHigh(req.Effort) && (to == provider.Gemini || to == provider.CodeAssist) && s.turnedAway(p, levelTarget, "xhigh", to) {
+			// xhigh turned away by name on a translation onto Gemini,
+			// Code Assist or Vertex: high from then on, the same mark
+			// the passthrough keeps (#7400)
+			r := *req
+			r.Effort, req = "high", &r
+		}
 		if to == provider.Anthropic && req.ThinkOff && !s.fits(p.ID, offRefused(model), to) {
 			req = thinkingBackOn(p, model, req)
 		}
@@ -8822,7 +9082,25 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			r := *req
 			r.Metadata, req = nil, &r
 		}
-		if want := to == provider.Chat && geminiCompat(p.VendorHost(), model) && s.fits(p.ID, thinkingConfigField, to); want != req.GeminiCompat {
+		// the model an alias actually asks for (SetModelID / SetUpstreamName),
+		// resolved before the effort was fitted. Kept here for a retry that
+		// replaced the request. Generation, GeminiCompat and thinking levels
+		// read it; refusals stay marked on the id magpie lists (#7400).
+		as := geminiCheckedModelAt(ctx, p, model, wires)
+		eff := geminiGateEffortsAt(ctx, p, model, as)
+		if as != model && req.geminiAs != as || !req.geminiEffortsSet || !slices.Equal(req.geminiEfforts, eff) {
+			r := *req
+			if as != model {
+				r.geminiAs = as
+			}
+			r.geminiEfforts, r.geminiEffortsSet = eff, true
+			req = &r
+		}
+		compatModel := model
+		if req.geminiAs != "" {
+			compatModel = req.geminiAs
+		}
+		if want := to == provider.Chat && geminiCompat(p.VendorHost(), compatModel) && s.fits(p.ID, thinkingConfigField, to); want != req.GeminiCompat {
 			r := *req
 			r.GeminiCompat, req = want, &r
 		}
@@ -8830,14 +9108,23 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			// Gemini 3 turns away a thinking level the model hasn't
 			// (gemini-3.8-flash has no minimal): reasoning off goes at the
 			// least it has, and an effort at the nearest, of the levels
-			// not turned away before
-			levels := s.geminiLevels(p, model, to)
+			// not turned away before. xhigh and max are fitted the same way,
+			// so a refusal of xhigh retries at high instead of marking
+			// thinking_config unfit for the provider and max never reaches
+			// the wire (#7400).
+			levels := s.geminiCompatLevels(ctx, p, model, as, levelTarget, to)
 			if req.ThinkOff {
 				if l := fitEffort("minimal", levels); l != req.OffLevel {
 					r := *req
 					r.OffLevel, req = l, &r
 				}
-			} else if e := fitEffort(req.Effort, levels); slices.Contains(gemini3Levels, req.Effort) && e != req.Effort {
+			} else if e := fitEffort(req.Effort, levels); geminiLevelRefits(req.Effort) && e != req.Effort {
+				r := *req
+				r.Effort, req = e, &r
+			}
+		} else if to == provider.Chat && geminiCompat(p.VendorHost(), compatModel) && geminiLevelRefits(req.Effort) {
+			levels := s.geminiCompatLevels(ctx, p, model, as, levelTarget, to)
+			if e := fitEffort(req.Effort, levels); e != req.Effort {
 				r := *req
 				r.Effort, req = e, &r
 			}
@@ -8923,8 +9210,12 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			}
 		}
 		// a relay's effort family goes as the id of the effort the
-		// request was built at (effort_variants.go)
-		wire := provider.UpstreamNameAsIn(wires, p.ID, model, p.SentIDAt(model, req.Effort))
+		// request was built at (effort_variants.go). An alias's upstream
+		// model is the one the body is addressed to. The provider's "*"
+		// is applied once, on the listed id: geminiAs is the canonical
+		// model the levels were read from, and looking it up again wrapped
+		// openai/* around openai/gpt-5 (#7400).
+		wire := upstreamWireAt(ctx, wires, p, model, req)
 		sent := req
 		if dropsBillingLine(p, to, model, wire) && billingHeader.MatchString(req.System) {
 			// Claude Code's billing line, which changes every turn, as the
@@ -8938,7 +9229,6 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		if err != nil {
 			return nil, to, err
 		}
-		noteWireEffort(ctx, to, sent)
 		if to == provider.Anthropic && !s.fits(p.ID, thinkingNeeded(model), to) {
 			// a model whose upstream said thinking must be enabled
 			// (thinkingNeededRefusal): a request built thinking off, or
@@ -8991,20 +9281,34 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		// the built body as the relayed one
 		body = xaiBody(p, to, body)
 		// a Gemini 3 or later on an Anthropic or Chat relay is asked a
-		// thinking level, never a budget (gemini_level_body.go)
-		body = geminiLevelBody(p, to, model, body)
+		// thinking level, never a budget (gemini_level_body.go). An alias
+		// is judged by the model the upstream is asked for.
+		levelAt := model
+		if sent.geminiAs != "" {
+			levelAt = sent.geminiAs
+		}
+		body = geminiLevelBody(p, to, model, levelAt, body)
 		if to == provider.CodeAssist && p.Account != nil {
 			// the envelope is named in there, where the id it carries is
 			// known: on Antigravity that is the variant the effort picked,
 			// not the model magpie knows. It is built from what goes
 			// (sent), the billing line left out as for buildFor
-			body = codeAssistBody(p, sent, model, wires)
+			body = codeAssistBodyAt(ctx, p, sent, model, wires)
 		} else if wire != model {
 			// the vendor's own name for the model goes in the model field
 			// and nowhere else: everything above shaped the request from
 			// the model magpie knows, which is what those decisions are
 			// about
 			body = rewriteModel(body, wire)
+		}
+		// after the envelope, so Code Assist's thinkingLevel is the one
+		// the log reads, not the body buildFor made first. A Gemini
+		// plugin is told the effort in a header, which keeps minimal and
+		// xhigh the body's thinkingLevel cannot: that is what the log
+		// keeps, unless the provider's own fields changed the level.
+		noteWireEffort(ctx, to, sent, body)
+		if p.IsPlugin() && (to == provider.Gemini || to == provider.CodeAssist) && req.Effort != "" {
+			noteGeminiPluginEffort(ctx, req.Effort, body)
 		}
 		path := upstreamPath(p, to, wire)
 		if req.Resume && to == provider.Chat && chatPrefill(p.VendorHost(), model) == "prefix" {
@@ -9017,7 +9321,8 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		if p.IsPlugin() && req.Effort != "" {
 			// the effort picked, which a plugin's model with variants is
 			// told in X-Magpie-Effort: the body says only what Gemini's
-			// thinkingConfig can, and loses minimal and xhigh
+			// thinkingConfig can, and loses minimal, and xhigh on a
+			// Gemini before 4
 			fctx = provider.WithEffort(ctx, req.Effort)
 		}
 		res, err := s.forward(fctx, p, to, path, p.Prepare(body), in)
@@ -9107,18 +9412,34 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 				continue
 			}
 		}
-		if req.GeminiCompat && res.StatusCode == http.StatusBadRequest {
+		if req.GeminiCompat && badRequest(res.StatusCode) {
 			if l := geminiRefusedLevel(b); l != "" {
-				// a thinking level the model hasn't, turned away: Gemini's
-				// fields were taken (not refusesThinkingConfig), and the
-				// model is asked again at the nearest level it has left,
-				// and so from then on. One turned away again, with no
-				// other left, goes back as it came.
-				if slices.Contains(levelsRefused, l) {
+				if sent := sentGeminiLevel(fctx, to, body, true); sent != "" && strings.EqualFold(sent, l) {
+					// a thinking level the model hasn't, turned away: Gemini's
+					// fields were taken (not refusesThinkingConfig), and the
+					// model is asked again at the nearest level it has left,
+					// and so from then on. One turned away again, with no
+					// other left, goes back as it came.
+					if slices.Contains(levelsRefused, l) {
+						return res, to, nil
+					}
+					levelsRefused = append(levelsRefused, l)
+					s.markUnfit(p.ID, levelRefused(levelTarget, l), to)
+					continue
+				}
+			}
+		}
+		if !req.GeminiCompat && (to == provider.Gemini || to == provider.CodeAssist) && badRequest(res.StatusCode) {
+			if strings.EqualFold(sentGeminiLevel(fctx, to, body, false), "xhigh") && strings.EqualFold(geminiRefusedLevel(b), "xhigh") {
+				// the same refusal on a translation onto Gemini, Code
+				// Assist or Vertex. The next pass asks high, and so does
+				// the next request. One turned away again goes back as
+				// it came, rather than marking thinking_config unfit.
+				if slices.Contains(levelsRefused, "xhigh") {
 					return res, to, nil
 				}
-				levelsRefused = append(levelsRefused, l)
-				s.markUnfit(p.ID, levelRefused(model, l), to)
+				levelsRefused = append(levelsRefused, "xhigh")
+				s.markUnfit(p.ID, levelRefused(levelTarget, "xhigh"), to)
 				continue
 			}
 		}
@@ -11264,20 +11585,143 @@ func onEffort(p provider.Provider, model string) string {
 	return fitEffort("low", levels)
 }
 
-// geminiLevels are the thinking levels model is asked at on Gemini's
-// OpenAI-compatible API, less those it turned away before (turnedAway):
-// its own, or Gemini 3's where they aren't known or none of its own is
-// left.
-func (s *Server) geminiLevels(p provider.Provider, model string, to provider.Protocol) []string {
-	left := func(levels []string) []string {
+// passthroughGemini reports whether a relayed request is Gemini's own API
+// or Gemini's OpenAI-compatible Chat, so xhigh is clamped and a refusal
+// of it is asked again at high. model is the id the upstream is asked
+// for when an alias sends another.
+func passthroughGemini(p provider.Provider, proto provider.Protocol, model string) bool {
+	switch proto {
+	case provider.Gemini:
+		return true
+	case provider.Chat:
+		return geminiCompat(p.VendorHost(), model)
+	default:
+		return false
+	}
+}
+
+// geminiGateEfforts are the levels xhigh and the other Gemini levels are
+// fitted to. A rename onto another model uses that model's levels. The
+// id magpie lists keeps a live /v1/models list and the user's
+// SetModelEfforts: SetModelID moves both onto it, and an opaque
+// deployment id names neither a generation nor a catalog model. A
+// wrapping "*" that only spells an unidentified alias (quartz via
+// gemini-4-* becomes gemini-4-quartz) keeps the listed id's levels (#7400).
+func geminiGateEfforts(p provider.Provider, listed, upstream string) []string {
+	return geminiGateEffortsAt(context.Background(), p, listed, upstream)
+}
+
+func geminiGateEffortsAt(ctx context.Context, p provider.Provider, listed, upstream string) []string {
+	if upstream == "" {
+		upstream = listed
+	}
+	own := ownModelIDAt(ctx, p, listed)
+	distinct := geminiRepointsIdentified(listed, own, upstream)
+	if !distinct {
+		if e := p.Efforts(listed); len(e) > 0 {
+			return slices.Clone(e)
+		}
+		if upstream != listed {
+			if e := p.Efforts(upstream); len(e) > 0 {
+				return slices.Clone(e)
+			}
+		}
+		if e := catalog.EffortsOf(upstream); len(e) > 0 {
+			return e
+		}
+		if upstream != listed {
+			return catalog.EffortsOf(listed)
+		}
+		return nil
+	}
+	if e := p.Efforts(upstream); len(e) > 0 {
+		return slices.Clone(e)
+	}
+	if e := catalog.EffortsOf(upstream); len(e) > 0 {
+		return e
+	}
+	// the target is a model of its own and nothing records its levels.
+	// Borrowing the listed model's sent Hydrogen's xhigh to an uncataloged
+	// Quartz. Unknown stays unknown, and xhigh falls back to high.
+	return nil
+}
+
+// effortFitModel is the id fitFor reads levels, levelless and reasonless
+// from. An upstream name that identifies a model keeps its own. An opaque
+// deployment id, or the vendor id a SetModelID no longer stores efforts
+// under, falls back to the id magpie lists.
+func effortFitModel(p provider.Provider, listed, upstream string) string {
+	return effortFitModelAt(context.Background(), p, listed, upstream)
+}
+
+func effortFitModelAt(ctx context.Context, p provider.Provider, listed, upstream string) string {
+	if upstream == "" || upstream == listed {
+		return listed
+	}
+	own := ownModelIDAt(ctx, p, listed)
+	// a wrapping expansion of an unidentified alias is still that alias:
+	// its SetModelEfforts and Reasonless win over the expanded name's
+	// catalog (#7400)
+	if !geminiRepointsIdentified(listed, own, upstream) && (len(p.Efforts(listed)) > 0 || p.Levelless(listed) || provider.Reasonless(p.ID, listed)) {
+		return listed
+	}
+	if len(p.Efforts(upstream)) > 0 || p.Levelless(upstream) || provider.Reasonless(p.ID, upstream) {
+		return upstream
+	}
+	if upstream == own || !modelIdentified(upstream) || !geminiRepointsIdentified(listed, own, upstream) {
+		if len(p.Efforts(listed)) > 0 || p.Levelless(listed) || provider.Reasonless(p.ID, listed) {
+			return listed
+		}
+	}
+	return upstream
+}
+
+// geminiRepointsIdentified reports whether upstream is a different model
+// than an identified listed or vendor id. A wrapping "*" that only spells
+// an unidentified alias (quartz via gemini-4-*, or gem/quartz → gemini-4-*)
+// is still that alias: SetModelEfforts and Reasonless stay on it. A literal
+// target that moves an identified model (gemini-4-hydrogen → gemini-4-quartz,
+// gem/* → gemini-4-argon) is the target's own levels.
+func geminiRepointsIdentified(listed, own, upstream string) bool {
+	if upstream == "" || upstream == listed || upstream == own || !modelIdentified(upstream) {
+		return false
+	}
+	source := listed
+	if !modelIdentified(listed) {
+		source = own
+	}
+	return modelIdentified(source) && upstream != source
+}
+
+// geminiCompatLevels are the thinking levels model is asked at on Gemini's
+// OpenAI-compatible API, less those target turned away before
+// (levelRefused) or reasoning off refused on listed. An alias is fitted to
+// the upstream model's levels. Where none are known, Gemini 3's — which have
+// no xhigh.
+func (s *Server) geminiCompatLevels(ctx context.Context, p provider.Provider, listed, upstream, target string, to provider.Protocol) []string {
+	if target == "" {
+		target = listed
+	}
+	filter := func(levels []string) []string {
+		capLevel := "high"
+		if geminiGeneration(strings.ToLower(upstream)) >= 4 {
+			capLevel = "xhigh"
+		}
+		maxIdx := slices.Index(effortRank, capLevel)
 		return slices.DeleteFunc(slices.Clone(levels), func(l string) bool {
-			return s.turnedAway(p, model, l, to)
+			ll := strings.ToLower(l)
+			return ll == "max" || slices.Index(effortRank, ll) > maxIdx || !s.fits(p.ID, levelRefused(target, l), to) || offEffort(l) && !s.fits(p.ID, offRefused(listed), to)
 		})
 	}
-	if levels := left(p.Efforts(model)); len(levels) > 0 {
-		return levels
+	// the model's own, while any is left. Once each of those has been
+	// turned away, Gemini 3's that remain, so a model whose low and high
+	// are both refused is still asked at minimal and medium.
+	if raw := geminiGateEffortsAt(ctx, p, listed, upstream); len(raw) > 0 {
+		if left := filter(raw); len(left) > 0 {
+			return left
+		}
 	}
-	return left(gemini3Levels)
+	return filter(gemini3Levels)
 }
 
 // offRefused is how unfit remembers a provider refusing reasoning turned
@@ -11396,7 +11840,19 @@ func withBodyEffort(proto provider.Protocol, body []byte, effort string) []byte 
 		v.OutputConfig["effort"] = effort
 		return withFields(body, map[string]any{"output_config": v.OutputConfig})
 	case provider.Chat:
+		// Google's OpenAI-compatible API rejects a body that carries both
+		// reasoning_effort and extra_body.google.thinking_config. A body
+		// that named the level only there is rewritten there (#7400). Any
+		// other Chat body rewrites only reasoning_effort so non-Gemini
+		// upstreams keep nested extra_body fields untouched.
+		if chatGeminiLevelOnly(body) {
+			return withGeminiCompatLevel(body, effort)
+		}
 		return withFields(body, map[string]any{"reasoning_effort": effort})
+	case provider.Gemini:
+		// passthrough clamps a level the model hasn't (xhigh on Argon)
+		// into the body it already logged (#7400)
+		return withGeminiThinkingLevel(body, effort)
 	case provider.Responses:
 		var v struct {
 			Reasoning map[string]any `json:"reasoning"`
@@ -11412,6 +11868,132 @@ func withBodyEffort(proto provider.Protocol, body []byte, effort string) []byte 
 		return withFields(body, map[string]any{"reasoning": v.Reasoning})
 	}
 	return body
+}
+
+// withGeminiThinkingLevel sets generationConfig.thinkingConfig's thinking
+// level to effort, keeping the key the body already uses (thinkingLevel or
+// thinking_level) and every other field. A body with no level — a budget,
+// or no thinkingConfig — is returned as it came. effort is already the
+// level the model is being asked at.
+func withGeminiThinkingLevel(body []byte, effort string) []byte {
+	if effort == "" || !bytes.Contains(body, []byte("thinking")) {
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var top map[string]any
+	if dec.Decode(&top) != nil {
+		return body
+	}
+	gcKey := "generationConfig"
+	if _, ok := top[gcKey]; !ok {
+		if _, ok := top["generation_config"]; ok {
+			gcKey = "generation_config"
+		}
+	}
+	gc, _ := top[gcKey].(map[string]any)
+	if gc == nil {
+		return body
+	}
+	tcKey := "thinkingConfig"
+	if _, ok := gc[tcKey]; !ok {
+		if _, ok := gc["thinking_config"]; ok {
+			tcKey = "thinking_config"
+		}
+	}
+	tc, _ := gc[tcKey].(map[string]any)
+	if tc == nil {
+		return body
+	}
+	levelKey := "thinkingLevel"
+	if _, ok := tc[levelKey]; !ok {
+		if _, ok := tc["thinking_level"]; ok {
+			levelKey = "thinking_level"
+		} else {
+			return body
+		}
+	}
+	// a non-string, or an empty string, is not a level to rewrite. "none"
+	// is, so a refusal can ask for low in its place (withBodyEffort).
+	cur, isStr := tc[levelKey].(string)
+	if !isStr || strings.TrimSpace(cur) == "" {
+		return body
+	}
+	tc[levelKey] = effort
+	gc[tcKey] = tc
+	return withFields(body, map[string]any{gcKey: gc})
+}
+
+// sentLevel is the thinking level a relayed body asks for. A Chat body
+// on Gemini's OpenAI-compatible API (geminiChat) may name it in
+// extra_body.google.thinking_config.thinking_level; non-Gemini Chat bodies
+// read only top-level reasoning_effort (#7400).
+func sentLevel(proto provider.Protocol, body []byte, geminiChat bool) string {
+	if proto == provider.Chat && geminiChat {
+		if e, ok := chatGeminiLevel(body); ok {
+			return e
+		}
+	}
+	return bodyEffort(proto, body)
+}
+
+// chatGeminiLevelOnly reports a Chat body whose Gemini level lives only in
+// extra_body.google.thinking_config, with no top-level reasoning_effort.
+// Putting both on the wire is what AI Studio turns away (#7400).
+func chatGeminiLevelOnly(body []byte) bool {
+	// the top-level field, not the bytes: the word in a prompt, a system
+	// prompt or a tool is not a level beside thinking_config (#7400).
+	if strings.TrimSpace(gjson.GetBytes(body, "reasoning_effort").String()) != "" {
+		return false
+	}
+	_, ok := chatGeminiLevel(body)
+	return ok
+}
+
+// withGeminiCompatLevel sets extra_body.google.thinking_config's thinking
+// level to effort when the body has one, keeping the key it already uses.
+// A body with no such level is returned as it came.
+func withGeminiCompatLevel(body []byte, effort string) []byte {
+	if effort == "" || (!bodyHas(body, "thinking_level") && !bodyHas(body, "thinkingLevel")) {
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var top map[string]any
+	if dec.Decode(&top) != nil {
+		return body
+	}
+	eb, _ := top["extra_body"].(map[string]any)
+	google, _ := eb["google"].(map[string]any)
+	if google == nil {
+		return body
+	}
+	key := "thinking_config"
+	if _, ok := google[key]; !ok {
+		key = "thinkingConfig"
+	}
+	tc, _ := google[key].(map[string]any)
+	if tc == nil {
+		return body
+	}
+	levelKey := ""
+	for _, k := range []string{"thinking_level", "thinkingLevel"} {
+		if _, ok := tc[k]; ok {
+			levelKey = k
+			break
+		}
+	}
+	if levelKey == "" {
+		return body
+	}
+	cur, isStr := tc[levelKey].(string)
+	if !isStr || strings.TrimSpace(cur) == "" || strings.EqualFold(cur, effort) {
+		return body
+	}
+	tc[levelKey] = effort
+	google[key] = tc
+	eb["google"] = google
+	return withFields(body, map[string]any{"extra_body": eb})
 }
 
 func hasReasoningDisabled(body []byte) bool {

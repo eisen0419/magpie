@@ -36,6 +36,9 @@ import (
 // buildVertex is a streamGenerateContent body for Vertex AI, which names the
 // model in its path and has none in here.
 func buildVertex(r *Request, model string) ([]byte, error) {
+	if r != nil && r.geminiAs != "" {
+		model = r.geminiAs
+	}
 	req, err := geminiRequest(r, model, "vertex")
 	if err != nil {
 		return nil, err
@@ -54,6 +57,9 @@ func buildVertex(r *Request, model string) ([]byte, error) {
 // enabled"), and Pro, which can't stop ("does not support setting
 // thinking_budget to 0"), its least. A Gemini before 2.5 doesn't think.
 func vertexThinking(r *Request, model string) map[string]any {
+	if r != nil && r.geminiAs != "" {
+		model = r.geminiAs
+	}
 	m := strings.ToLower(model)
 	if strings.HasPrefix(m, "gemini-1") || strings.HasPrefix(m, "gemini-2.0") {
 		return nil
@@ -73,7 +79,19 @@ func vertexThinking(r *Request, model string) map[string]any {
 	}
 	tc := map[string]any{"includeThoughts": !r.ThinkOff}
 	if r.Effort != "" {
-		tc["thinkingLevel"] = r.Effort
+		level := r.Effort
+		// argon, and an unlisted Gemini 4, are not sent xhigh even when
+		// the effort was fitted against another name (#7400). max and ultra
+		// are not Gemini levels: xhigh where this model lists it, else high,
+		// including when a custom list still names max.
+		if geminiAboveHigh(level) {
+			if r.allowsXHigh(model) {
+				level = "xhigh"
+			} else {
+				level = "high"
+			}
+		}
+		tc["thinkingLevel"] = level
 	}
 	return tc
 }
@@ -108,7 +126,18 @@ func vertexEffort(req *Request, levels []string) *Request {
 		return req
 	}
 	if len(levels) > 0 {
-		e = fitEffort(e, levels)
+		maxIdx := slices.Index(effortRank, "xhigh")
+		wireLevels := slices.DeleteFunc(slices.Clone(levels), func(l string) bool {
+			ll := strings.ToLower(l)
+			return ll == "max" || slices.Index(effortRank, ll) > maxIdx
+		})
+		if len(wireLevels) > 0 {
+			e = fitEffort(e, wireLevels)
+		} else if at := slices.Index(effortRank, e); at < slices.Index(effortRank, "low") {
+			e = "low"
+		} else if at > slices.Index(effortRank, "high") {
+			e = "high"
+		}
 	} else if at := slices.Index(effortRank, e); at < slices.Index(effortRank, "low") {
 		e = "low"
 	} else if at > slices.Index(effortRank, "high") {
