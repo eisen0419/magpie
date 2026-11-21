@@ -81,30 +81,36 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.waitForTimeout(300); // the editor drawn again as what it asked for comes in
 
         // each block: whether it is the top one, its label, its keys, its
-        // note, and where it sits among the accounts, Routing and Models
+        // note, and where it sits among the accounts, Routing and Models.
+        // Routing is inside Advanced, so it is not a direct row of the
+        // editor; the top block is still before it.
         const seen = await ed.evaluate((ed, w) => {
           const e = ed.querySelector(":scope > .ebody") || ed, kids = [...e.children];
           const at = (x) => kids.findIndex((k) => k.contains(x));
           const label = (text) => kids.findIndex((k) => k.tagName === "LABEL" && k.textContent === text);
+          const routing = [...e.querySelectorAll("label")].find((l) => l.textContent === w.routing);
+          const before = (a, b) => !!(a && b && (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING));
+          const accounts = at(e.querySelector(".accts")), models = label(w.models);
           return {
-            accounts: at(e.querySelector(".accts")), routing: label(w.routing), models: label(w.models),
+            accounts, models, hasRouting: !!routing,
             blocks: [...e.querySelectorAll(".plugin-options")].map((b) => ({
-              top: b.classList.contains("top"), at: at(b), label: kids[at(b) - 1].textContent,
+              top: b.classList.contains("top"), at: at(b), beforeRouting: before(b, routing),
+              label: kids[at(b) - 1].textContent,
               keys: [...b.querySelectorAll(".plugin-option")].map((o) => o.dataset.key),
               note: !!kids[at(b)].querySelector(":scope > .hint"),
             })),
             spill: document.documentElement.scrollWidth - document.documentElement.clientWidth,
           };
         }, w);
-        assert.ok(seen.accounts >= 0 && seen.routing > seen.accounts && seen.models > seen.routing, JSON.stringify(seen));
+        assert.ok(seen.accounts >= 0 && seen.models > seen.accounts && seen.hasRouting, JSON.stringify(seen));
         const shape = seen.blocks.map((b) => [b.top, b.label, b.keys, b.note]);
         if (which === "mixed") {
           assert.deepEqual(shape, [[true, w.field, ["panel"], true], [false, w.field, ["free_only"], false]]);
-          assert.ok(seen.blocks[0].at > seen.accounts && seen.blocks[0].at < seen.routing, "the top block sits between the accounts and Routing: " + JSON.stringify(seen));
+          assert.ok(seen.blocks[0].at > seen.accounts && seen.blocks[0].at < seen.models && seen.blocks[0].beforeRouting, "the top block sits between the accounts and Models, above Routing: " + JSON.stringify(seen));
           assert.ok(seen.blocks[1].at > seen.models, "the rest stay under the models: " + JSON.stringify(seen));
         } else if (which === "top") {
           assert.deepEqual(shape, [[true, w.field, ["panel"], true]]);
-          assert.ok(seen.blocks[0].at > seen.accounts && seen.blocks[0].at < seen.routing, JSON.stringify(seen));
+          assert.ok(seen.blocks[0].at > seen.accounts && seen.blocks[0].at < seen.models && seen.blocks[0].beforeRouting, JSON.stringify(seen));
         } else {
           assert.deepEqual(shape, [[false, w.field, ["panel", "free_only"], true]]);
           assert.ok(seen.blocks[0].at > seen.models, "as before, under the models: " + JSON.stringify(seen));
